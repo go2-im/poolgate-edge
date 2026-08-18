@@ -23,11 +23,13 @@ npm run dev
 
 Copy `.dev.vars.example` to `.dev.vars` and generate a 32-byte base64 master key. Never commit `.dev.vars`.
 
-Production secrets are set with:
+Production secrets are set only as an explicit configuration operation:
 
 ```sh
 npx wrangler secret put MASTER_KEY
 ```
+
+Normal deployments must use `npm run deploy`. Its `--keep-vars` flag and the matching `keep_vars` configuration preserve dashboard-managed Worker variables; `--strict` rejects conflicting remote changes. `MASTER_KEY` is declared as required, so a deployment fails before upload when the deployed Worker does not have it. Secrets are preserved by Wrangler deployments unless a secret-delete command is explicitly run.
 
 ## Production configuration
 
@@ -41,10 +43,12 @@ Before deployment:
 6. Set the Access team domain and Admin application AUD tag.
 7. Set `MASTER_KEY`.
 
+Production Worker variables are managed in the Cloudflare dashboard, not in `wrangler.jsonc`; the configuration intentionally contains no `vars` section so a code deploy cannot overwrite their values. Use `.dev.vars` locally (copied from `.dev.vars.example`) instead.
+
 Once local Durable Object state contains an account, starting Wrangler enables the same authorized automatic usage polling as production. Use only disposable credentials in local state, or clear the local Wrangler state before testing without upstream egress.
 8. Run typecheck, tests, and dry-run build.
 9. Verify authentication with `npx wrangler whoami`.
-10. Deploy first to a staging Worker and use a non-critical account for the proof.
+10. Deploy first to a staging Worker and use a non-critical account for the proof. Use `npm run deploy`; do not invoke a raw deploy with flags that disable variable preservation.
 
 ## Test layers
 

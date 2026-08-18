@@ -1,4 +1,12 @@
 # Generate with: openssl rand -base64 32
 MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
+ENVIRONMENT=development
+ADMIN_HOST=admin.poolgate.example.com
+PROXY_HOST=api.poolgate.example.com
+ADMIN_AUTH_MODE=access
 ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 ACCESS_AUD=replace-with-access-application-aud-tag
+UPSTREAM_BASE=https://chatgpt.com/backend-api/codex
+OAUTH_ISSUER=https://auth.openai.com/oauth/token
+OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
+MAX_REQUEST_BODY_BYTES=8388608

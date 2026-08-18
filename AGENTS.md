@@ -54,5 +54,6 @@ Use `GITHUB_TOKEN_WITH_GO2_IM` with the GitHub REST API for protection or PR adm
 
 - Treat Cloudflare Worker secrets, dashboard environment variables, `.dev.vars`, and deployment bindings as protected configuration.
 - A normal code deployment must not reset, replace, delete, or bulk-import Worker secrets or environment variables.
+- Use `npm run deploy` for a normal production deployment. It preserves dashboard-managed variables and validates the required production secret before upload; do not replace it with an unsafe raw Wrangler command.
 - Do not run `wrangler secret put`, `wrangler secret delete`, `wrangler secret bulk`, or any Cloudflare configuration API/binding update unless the user explicitly requests that exact configuration change.
 - Do not add, remove, or alter `vars`, secrets, bindings, routes, or environment sections in Wrangler configuration as an incidental part of a code deployment. Review deployment configuration separately before any deploy.
