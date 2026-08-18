@@ -78,8 +78,19 @@
           <aside class="import-panel">
             <div class="panel-number" aria-hidden="true">01</div>
             <p class="eyebrow">ADD CREDENTIALS</p>
-            <h2>Import an account</h2>
-            <p class="panel-intro">Paste a Codex <code>auth.json</code>. Tokens are encrypted before they enter Durable Object storage.</p>
+            <h2>Add an account</h2>
+            <p class="panel-intro">Sign in using the official Codex device flow. No ChatGPT password or Cloudflare Access credential is sent to Poolgate.</p>
+            <form id="device-login-form">
+              <label for="device-login-label">Account label <span>Optional</span></label>
+              <input id="device-login-label" maxlength="80" autocomplete="off" placeholder="Personal Pro" />
+              <button class="primary-button" id="device-login-button" type="submit">
+                <span>Sign in with ChatGPT</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 5 7 7-7 7-1.4-1.4 4.6-4.6H4v-2h12.2l-4.6-4.6L13 5Z" /></svg>
+              </button>
+              <p class="form-message" id="device-login-message" role="status"></p>
+            </form>
+            <div class="form-divider"><span>or import manually</span></div>
+            <p class="panel-intro fallback-intro">Paste a Codex <code>auth.json</code>. Tokens are encrypted before they enter Durable Object storage.</p>
             <form id="import-form">
               <label for="label">Account label <span>Optional</span></label>
               <input id="label" name="label" autocomplete="off" placeholder="Personal Pro" />
@@ -216,6 +227,20 @@
         <button class="primary-button" id="account-save-button" type="submit"><span>Save account</span></button>
         <p class="form-message" id="account-edit-message" role="status"></p>
       </form>
+    </dialog>
+
+    <dialog id="device-login-dialog" aria-labelledby="device-login-title">
+      <button class="dialog-close" id="device-login-dialog-close" type="button" aria-label="Close">×</button>
+      <p class="eyebrow">CHATGPT DEVICE SIGN-IN</p>
+      <h2 id="device-login-title">Authorize this account</h2>
+      <p>Open the official ChatGPT page, then enter this one-time code. Continue only because you started this login here.</p>
+      <code class="device-code" id="device-login-code"></code>
+      <div class="device-login-actions">
+        <a class="copy-button" id="device-login-open" target="_blank" rel="noopener noreferrer">Open ChatGPT sign-in</a>
+        <button class="regenerate-button" id="device-login-copy" type="button">Copy code</button>
+      </div>
+      <p class="form-message" id="device-login-status" role="status">Waiting for authorization…</p>
+      <button class="regenerate-button device-check" id="device-login-check" type="button">Check status now</button>
     </dialog>
 
     <dialog id="key-edit-dialog" aria-labelledby="key-edit-title">

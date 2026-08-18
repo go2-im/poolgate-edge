@@ -39,6 +39,7 @@ It owns:
 - Current health, cooldown, usage, and concurrency state.
 - Non-destructive administrator enable/disable state, independent from upstream health state.
 - OAuth refresh single-flight and credential-version CAS.
+- Short-lived encrypted device-code login state and provider polling leases.
 - HTTP/SSE upstream fetches and response streams.
 - Both sides of each WebSocket proxy connection.
 - Turn-affinity mappings.

@@ -88,7 +88,7 @@ After deployment:
 1. Check `/healthz` on the Proxy hostname for outer Worker liveness.
 2. Check `/readyz` for a secret-free confirmation that at least one endpoint has an eligible account.
 3. Confirm an unknown hostname and cross-surface route fail closed.
-4. Open the Admin hostname through Access and import one account.
+4. Open the Admin hostname through Access and add one account using device-code sign-in or manual `auth.json` import.
 5. Leave the Proxy key list empty while migration validation is incomplete; imported accounts alone do not enable client access.
 6. When a test client is ready, explicitly create a scoped Proxy API key and save its one-time plaintext value.
 7. Send one HTTP/SSE request through the Proxy hostname.

@@ -43,7 +43,7 @@ Returns the schema version and current resource counts.
 ```json
 {
   "service": "poolgate-edge",
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "accounts": 1,
   "endpoints": 1,
   "apiKeys": 0
@@ -85,6 +85,30 @@ The account is added to the default fallback group. Importing an account does no
 ```
 
 Re-importing the same upstream account replaces its encrypted credentials and increments its credential version.
+
+### `POST /admin/api/accounts/login/device`
+
+Starts the official Codex device-code flow with `{ "label": "Personal Pro" }`. Poolgate calls only the pinned OpenAI authorization host and returns a short-lived code and verification URL:
+
+```json
+{
+  "loginId": "login_...",
+  "verificationUrl": "https://auth.openai.com/codex/device",
+  "userCode": "ABCD-1234",
+  "intervalSeconds": 5,
+  "expiresAt": "..."
+}
+```
+
+The upstream device authorization ID and user code are encrypted in Durable Object SQLite with `MASTER_KEY`. Pending records expire after 15 minutes and are capped at eight. The Admin never asks for or receives the user's ChatGPT password.
+
+If the ChatGPT workspace has device authorization disabled, the endpoint returns `503 device_login_unavailable`; use manual `auth.json` import instead.
+
+### `POST /admin/api/accounts/login/device/:loginId/poll`
+
+Checks one pending device login. Calls are rate-limited to the interval supplied by the authorization server and protected by a short database lease so concurrent browser polls cannot exchange the same code twice.
+
+A login that is still waiting returns `202` with `{ "status": "pending", "retryAfter": 5 }` and a matching `Retry-After` header. On success, Poolgate validates the provider-returned PKCE challenge, exchanges the authorization code at the pinned token endpoint, encrypts the resulting tokens, consumes the pending login, and returns only non-secret account metadata. The account is added to the default group in `unknown` state so the next usage check establishes its current health. No Proxy API key is created.
 
 ### `PATCH /admin/api/accounts/:id`
 

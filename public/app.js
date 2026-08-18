@@ -16,6 +16,17 @@ const elements = {
   formMessage: document.querySelector("#form-message"),
   label: document.querySelector("#label"),
   content: document.querySelector("#content"),
+  deviceLoginForm: document.querySelector("#device-login-form"),
+  deviceLoginLabel: document.querySelector("#device-login-label"),
+  deviceLoginButton: document.querySelector("#device-login-button"),
+  deviceLoginMessage: document.querySelector("#device-login-message"),
+  deviceLoginDialog: document.querySelector("#device-login-dialog"),
+  deviceLoginDialogClose: document.querySelector("#device-login-dialog-close"),
+  deviceLoginCode: document.querySelector("#device-login-code"),
+  deviceLoginOpen: document.querySelector("#device-login-open"),
+  deviceLoginCopy: document.querySelector("#device-login-copy"),
+  deviceLoginStatus: document.querySelector("#device-login-status"),
+  deviceLoginCheck: document.querySelector("#device-login-check"),
   keyForm: document.querySelector("#key-form"),
   keyLabel: document.querySelector("#key-label"),
   keyExpiry: document.querySelector("#key-expiry"),
@@ -70,6 +81,9 @@ let editingApiKeyId = "";
 let availableEndpoints = [];
 let proxyBase = "";
 let memberChoiceSequence = 0;
+let deviceLoginId = "";
+let deviceLoginTimer = 0;
+let deviceLoginPolling = false;
 
 async function api(path, init) {
   const response = await fetch(path, { credentials: "include", ...init });
@@ -620,6 +634,41 @@ function renderEndpoints(endpoints, policyGroups) {
   updateClientConfig();
 }
 
+function scheduleDeviceLoginPoll(seconds) {
+  window.clearTimeout(deviceLoginTimer);
+  if (!deviceLoginId || !elements.deviceLoginDialog.open) return;
+  deviceLoginTimer = window.setTimeout(() => { void pollDeviceLogin(); }, Math.max(1, Number(seconds) || 5) * 1000);
+}
+
+async function pollDeviceLogin() {
+  if (!deviceLoginId || deviceLoginPolling || !elements.deviceLoginDialog.open) return;
+  deviceLoginPolling = true;
+  elements.deviceLoginCheck.disabled = true;
+  elements.deviceLoginStatus.className = "form-message";
+  elements.deviceLoginStatus.textContent = "Checking authorization…";
+  try {
+    const result = await api(`/admin/api/accounts/login/device/${encodeURIComponent(deviceLoginId)}/poll`, {
+      method: "POST"
+    });
+    if (result.status === "pending") {
+      elements.deviceLoginStatus.textContent = "Waiting for authorization…";
+      scheduleDeviceLoginPoll(result.retryAfter);
+      return;
+    }
+    elements.deviceLoginMessage.className = "form-message success";
+    elements.deviceLoginMessage.textContent = "ChatGPT account connected.";
+    elements.deviceLoginDialog.close();
+    elements.deviceLoginLabel.value = "";
+    await load();
+  } catch (error) {
+    elements.deviceLoginStatus.className = "form-message error";
+    elements.deviceLoginStatus.textContent = error.message;
+  } finally {
+    deviceLoginPolling = false;
+    elements.deviceLoginCheck.disabled = false;
+  }
+}
+
 async function load() {
   elements.refresh.classList.add("busy");
   try {
@@ -658,6 +707,57 @@ async function load() {
 }
 
 elements.refresh.addEventListener("click", load);
+elements.deviceLoginForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  elements.deviceLoginButton.disabled = true;
+  elements.deviceLoginMessage.className = "form-message";
+  elements.deviceLoginMessage.textContent = "Starting secure device sign-in…";
+  try {
+    const result = await api("/admin/api/accounts/login/device", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ label: elements.deviceLoginLabel.value })
+    });
+    deviceLoginId = result.loginId;
+    elements.deviceLoginCode.textContent = result.userCode;
+    elements.deviceLoginOpen.href = result.verificationUrl;
+    elements.deviceLoginStatus.className = "form-message";
+    elements.deviceLoginStatus.textContent = `Waiting for authorization · expires ${new Date(result.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    elements.deviceLoginMessage.textContent = "Complete authorization in the sign-in dialog.";
+    elements.deviceLoginDialog.showModal();
+    scheduleDeviceLoginPoll(result.intervalSeconds);
+  } catch (error) {
+    elements.deviceLoginMessage.className = "form-message error";
+    elements.deviceLoginMessage.textContent = error.message;
+  } finally {
+    elements.deviceLoginButton.disabled = false;
+  }
+});
+
+elements.deviceLoginCheck.addEventListener("click", () => { void pollDeviceLogin(); });
+elements.deviceLoginCopy.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(elements.deviceLoginCode.textContent);
+    elements.deviceLoginCopy.textContent = "Copied";
+  } catch {
+    elements.deviceLoginCopy.textContent = "Select code above";
+  }
+});
+elements.deviceLoginDialogClose.addEventListener("click", () => elements.deviceLoginDialog.close());
+elements.deviceLoginDialog.addEventListener("click", (event) => {
+  if (event.target === elements.deviceLoginDialog) elements.deviceLoginDialog.close();
+});
+elements.deviceLoginDialog.addEventListener("close", () => {
+  window.clearTimeout(deviceLoginTimer);
+  deviceLoginTimer = 0;
+  deviceLoginId = "";
+  elements.deviceLoginCode.textContent = "";
+  elements.deviceLoginOpen.removeAttribute("href");
+  elements.deviceLoginCopy.textContent = "Copy code";
+  elements.deviceLoginStatus.className = "form-message";
+  elements.deviceLoginStatus.textContent = "Waiting for authorization…";
+});
+
 elements.form.addEventListener("submit", async (event) => {
   event.preventDefault();
   elements.importButton.disabled = true;

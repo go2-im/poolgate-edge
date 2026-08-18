@@ -12,7 +12,7 @@
 
 Cloudflare Access authenticates the human operator before Admin requests reach the Worker. Poolgate API keys authenticate automated clients on the Proxy hostname. The Durable Object and its bindings are trusted application infrastructure. `chatgpt.com` and `auth.openai.com` are pinned external services.
 
-The browser-facing Admin application never receives pooled account tokens after import.
+The browser-facing Admin application never receives pooled account tokens after import or device-code token exchange. Device-login identifiers retained by the Durable Object are encrypted with `MASTER_KEY`, expire after 15 minutes, and are never logged.
 
 Automated current-usage polling is explicitly limited to `https://chatgpt.com/backend-api/wham/usage`. It sends the same account bearer token and `ChatGPT-Account-ID` pair required by normal Proxy traffic. Responses are bounded to 1 MiB and only the latest non-secret plan/window snapshot is stored; no usage history is retained.
 

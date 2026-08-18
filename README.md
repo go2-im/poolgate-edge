@@ -17,7 +17,7 @@ Backups, historical monitoring, notifications, tamper-evident audit logs, and ho
 
 ## Development status
 
-The first vertical slice is implemented locally: host isolation, cryptographic Cloudflare Access validation, Durable Object schema initialization, account import/edit/disable, current quota polling with bounded alarms, flat policy-group and endpoint management, explicit Proxy API-key management, HTTP/SSE proxying, WebSocket proxying, OAuth refresh, and a durable rotation journal. Cloud integration and real-account transport tests remain pending.
+The first vertical slice is implemented locally: host isolation, cryptographic Cloudflare Access validation, Durable Object schema initialization, official Codex device-code sign-in plus manual account import, account edit/disable, current quota polling with bounded alarms, flat policy-group and endpoint management, explicit Proxy API-key management, HTTP/SSE proxying, WebSocket proxying, OAuth refresh, and a durable rotation journal. Cloud integration and real-account transport tests remain pending.
 
 ## Trademark notice
 

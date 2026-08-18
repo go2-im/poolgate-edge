@@ -40,7 +40,7 @@ In priority order:
 ### Account lifecycle
 
 - Manual import of a Codex `auth.json` payload.
-- Browser-assisted OAuth with pasted callback URL in a later phase.
+- Official Codex device-code OAuth from the Admin UI, with bounded encrypted pending state and manual import as the fallback when a workspace disables device authorization.
 - Single-flight refresh per account.
 - Monotonic credential versions and compare-and-swap commits.
 - Passive cooldown after rate limits and transient upstream failures.

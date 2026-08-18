@@ -67,6 +67,20 @@ const migrations: ReadonlyArray<ReadonlyArray<string>> = [
   ],
   [
     `ALTER TABLE accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))`
+  ],
+  [
+    `CREATE TABLE IF NOT EXISTS oauth_device_logins (
+      id TEXT PRIMARY KEY,
+      device_auth_id TEXT NOT NULL,
+      user_code TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      interval_seconds INTEGER NOT NULL,
+      next_poll_at TEXT NOT NULL,
+      polling_until TEXT NOT NULL DEFAULT '',
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_oauth_device_logins_expires ON oauth_device_logins(expires_at)`
   ]
 ];
 

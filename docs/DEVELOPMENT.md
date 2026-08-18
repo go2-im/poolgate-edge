@@ -48,7 +48,7 @@ Once local Durable Object state contains an account, starting Wrangler enables t
 
 ## Test layers
 
-- Pure unit tests for parsing, routing policy, encryption format, and host classification.
+- Pure unit tests for parsing, routing policy, encryption format, device-code OAuth responses, and host classification.
 - Local Worker tests for Durable Object SQL and Admin APIs.
 - Remote tests for Static Assets, R2, WebSocket upgrades, and alarms.
 - Manual real-account tests for upstream compatibility; credentials must never be stored in fixtures.

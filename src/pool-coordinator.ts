@@ -8,10 +8,21 @@ import {
 } from "./credential-rotation";
 import { bearerToken, discardRequestBody, endpointFromPath, json, jsonError } from "./http";
 import { matchesIpAllowlist, normalizeIpAllowlist } from "./ip";
+import {
+  accountIdFromIdToken,
+  assertPinnedOAuthIssuer,
+  DEVICE_REDIRECT_URI,
+  DEVICE_TOKEN_URL,
+  DEVICE_USER_CODE_URL,
+  DEVICE_VERIFICATION_URL,
+  parseDeviceAuthorizationCode,
+  parseDeviceCodeStart
+} from "./oauth-device";
 import { accountAvailability, hasCapacity, isEligible, selectAccount, type SelectionState } from "./policy";
 import { currentSchemaVersion, migrateSchema } from "./schema";
 import type {
   AccountRecord,
+  AuthImportTokens,
   CandidateAccount,
   DecryptedAccount,
   EndpointResolution,
@@ -46,6 +57,9 @@ const EXPIRED_PROBE_INTERVAL_MS = 30 * 60_000;
 const MIN_ALARM_DELAY_MS = 1_000;
 const MAX_USAGE_RETRY_AFTER_MS = 24 * 60 * 60_000;
 const USAGE_REQUEST_TIMEOUT_MS = 20_000;
+const DEVICE_LOGIN_TTL_MS = 15 * 60_000;
+const DEVICE_LOGIN_MAX = 8;
+const DEVICE_LOGIN_LOCK_MS = 30_000;
 
 interface AccountRow {
   [key: string]: SqlStorageValue;
@@ -73,6 +87,23 @@ interface ImportRequest {
   content?: unknown;
   authJson?: unknown;
   label?: unknown;
+}
+
+interface DeviceLoginStartRequest {
+  label?: unknown;
+}
+
+interface DeviceLoginRow {
+  [key: string]: SqlStorageValue;
+  id: string;
+  device_auth_id: string;
+  user_code: string;
+  label: string;
+  interval_seconds: number;
+  next_poll_at: string;
+  polling_until: string;
+  expires_at: string;
+  created_at: string;
 }
 
 interface CreateApiKeyRequest {
@@ -271,6 +302,13 @@ export class PoolCoordinator {
     if (request.method === "POST" && url.pathname === "/admin/api/accounts/import") {
       return this.importAccount(request);
     }
+    if (request.method === "POST" && url.pathname === "/admin/api/accounts/login/device") {
+      return this.startDeviceLogin(request);
+    }
+    const deviceLoginMatch = /^\/admin\/api\/accounts\/login\/device\/([A-Za-z0-9_]+)\/poll$/.exec(url.pathname);
+    if (request.method === "POST" && deviceLoginMatch) {
+      return this.pollDeviceLogin(deviceLoginMatch[1]);
+    }
 
     const accountMatch = /^\/admin\/api\/accounts\/([A-Za-z0-9_]+)$/.exec(url.pathname);
     if (request.method === "PATCH" && accountMatch) {
@@ -345,6 +383,236 @@ export class PoolCoordinator {
       return jsonError(400, "invalid_auth_file", error instanceof Error ? error.message : "invalid auth.json");
     }
 
+    const label = text(input.label);
+    if (label.length > 80) return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
+    const stored = await this.storeAccount(tokens, label, "ok");
+    return json(
+      {
+        account: { id: stored.id, accountId: tokens.accountId, label, state: "ok", enabled: true }
+      },
+      stored.existed ? 200 : 201
+    );
+  }
+
+  private async startDeviceLogin(request: Request): Promise<Response> {
+    try {
+      assertPinnedOAuthIssuer(this.env.OAUTH_ISSUER);
+    } catch {
+      return jsonError(503, "oauth_misconfigured", "OAuth login is not configured safely");
+    }
+    const parsed = await this.readAdminJson<DeviceLoginStartRequest>(request);
+    if (parsed instanceof Response) return parsed;
+    const label = text(parsed.label);
+    if (label.length > 80) return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
+
+    this.pruneDeviceLogins();
+    let response: Response;
+    try {
+      response = await fetch(DEVICE_USER_CODE_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ client_id: this.env.OAUTH_CLIENT_ID }),
+        redirect: "error"
+      });
+    } catch {
+      return jsonError(502, "device_login_failed", "could not reach ChatGPT sign-in");
+    }
+    if (response.status === 404) {
+      return jsonError(503, "device_login_unavailable", "device-code login is not enabled; import auth.json instead");
+    }
+    if (!response.ok) return jsonError(502, "device_login_failed", "could not start ChatGPT sign-in");
+
+    let started;
+    try {
+      started = parseDeviceCodeStart(await response.json());
+    } catch {
+      return jsonError(502, "device_login_failed", "ChatGPT returned an invalid sign-in response");
+    }
+    const key = await this.masterKey;
+    const [deviceAuthId, userCode] = await Promise.all([
+      encryptSecret(key, started.deviceAuthId),
+      encryptSecret(key, started.userCode)
+    ]);
+    const id = randomId("login");
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + DEVICE_LOGIN_TTL_MS);
+    const nextPollAt = new Date(createdAt.getTime() + started.intervalSeconds * 1000);
+    this.state.storage.transactionSync(() => {
+      this.pruneDeviceLogins(createdAt.toISOString());
+      while (Number(this.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM oauth_device_logins").one().count) >= DEVICE_LOGIN_MAX) {
+        this.sql.exec(
+          `DELETE FROM oauth_device_logins WHERE id IN (
+             SELECT id FROM oauth_device_logins ORDER BY created_at ASC, id ASC LIMIT 1
+           )`
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO oauth_device_logins
+           (id, device_auth_id, user_code, label, interval_seconds, next_poll_at, polling_until, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)`,
+        id,
+        deviceAuthId,
+        userCode,
+        label,
+        started.intervalSeconds,
+        nextPollAt.toISOString(),
+        expiresAt.toISOString(),
+        createdAt.toISOString()
+      );
+    });
+    return json({
+      loginId: id,
+      verificationUrl: DEVICE_VERIFICATION_URL,
+      userCode: started.userCode,
+      intervalSeconds: started.intervalSeconds,
+      expiresAt: expiresAt.toISOString()
+    }, 201);
+  }
+
+  private async pollDeviceLogin(id: string): Promise<Response> {
+    const row = this.sql.exec<DeviceLoginRow>("SELECT * FROM oauth_device_logins WHERE id = ?", id).toArray()[0];
+    if (!row) return jsonError(404, "login_not_found", "sign-in was not found or has expired");
+    const now = Date.now();
+    if (Date.parse(row.expires_at) <= now) {
+      this.state.storage.transactionSync(() => this.sql.exec("DELETE FROM oauth_device_logins WHERE id = ?", id));
+      return jsonError(410, "login_expired", "sign-in expired; start again");
+    }
+    const nextPoll = Date.parse(row.next_poll_at);
+    const pollingUntil = Date.parse(row.polling_until);
+    const waitUntil = Math.max(Number.isFinite(nextPoll) ? nextPoll : 0, Number.isFinite(pollingUntil) ? pollingUntil : 0);
+    if (waitUntil > now) return this.deviceLoginPending(waitUntil - now);
+
+    const lockedUntil = new Date(now + DEVICE_LOGIN_LOCK_MS).toISOString();
+    let claimed = false;
+    this.state.storage.transactionSync(() => {
+      claimed = this.sql.exec<{ id: string }>(
+        `UPDATE oauth_device_logins SET polling_until = ?
+          WHERE id = ? AND expires_at > ? AND (polling_until = '' OR polling_until <= ?)
+          RETURNING id`,
+        lockedUntil,
+        id,
+        new Date(now).toISOString(),
+        new Date(now).toISOString()
+      ).toArray().length === 1;
+    });
+    if (!claimed) return this.deviceLoginPending(DEVICE_LOGIN_LOCK_MS);
+
+    let deviceAuthId: string;
+    let userCode: string;
+    try {
+      const key = await this.masterKey;
+      [deviceAuthId, userCode] = await Promise.all([
+        decryptSecret(key, row.device_auth_id),
+        decryptSecret(key, row.user_code)
+      ]);
+    } catch {
+      this.deleteDeviceLogin(id);
+      return jsonError(500, "login_state_invalid", "stored sign-in state could not be read; start again");
+    }
+
+    let tokenPoll: Response;
+    try {
+      tokenPoll = await fetch(DEVICE_TOKEN_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ device_auth_id: deviceAuthId, user_code: userCode }),
+        redirect: "error"
+      });
+    } catch {
+      this.releaseDeviceLoginPoll(id, Number(row.interval_seconds));
+      return jsonError(502, "device_login_failed", "could not check ChatGPT sign-in status");
+    }
+    if (tokenPoll.status === 403 || tokenPoll.status === 404) {
+      this.releaseDeviceLoginPoll(id, Number(row.interval_seconds));
+      return this.deviceLoginPending(Number(row.interval_seconds) * 1000);
+    }
+    if (!tokenPoll.ok) {
+      this.releaseDeviceLoginPoll(id, Number(row.interval_seconds));
+      return jsonError(502, "device_login_failed", "ChatGPT sign-in could not be completed");
+    }
+
+    let authorization;
+    try {
+      authorization = await parseDeviceAuthorizationCode(await tokenPoll.json());
+    } catch {
+      this.deleteDeviceLogin(id);
+      return jsonError(502, "device_login_failed", "ChatGPT returned an invalid authorization response");
+    }
+
+    let tokenResponse: Response;
+    try {
+      const issuer = assertPinnedOAuthIssuer(this.env.OAUTH_ISSUER);
+      tokenResponse = await fetch(issuer, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: authorization.authorizationCode,
+          redirect_uri: DEVICE_REDIRECT_URI,
+          client_id: this.env.OAUTH_CLIENT_ID,
+          code_verifier: authorization.codeVerifier
+        }),
+        redirect: "error"
+      });
+    } catch {
+      this.deleteDeviceLogin(id);
+      return jsonError(502, "device_login_failed", "could not exchange the ChatGPT authorization code");
+    }
+    if (!tokenResponse.ok) {
+      this.deleteDeviceLogin(id);
+      return jsonError(502, "device_login_failed", "ChatGPT rejected the authorization code; start again");
+    }
+    let tokens: AuthImportTokens;
+    try {
+      const payload = (await tokenResponse.json()) as OAuthResponse;
+      const accessToken = text(payload.access_token);
+      const refreshToken = text(payload.refresh_token);
+      const idToken = text(payload.id_token);
+      const accountId = accountIdFromIdToken(idToken);
+      if (!accessToken || !refreshToken || !idToken || !accountId) throw new Error("missing token field");
+      tokens = { accessToken, refreshToken, idToken, accountId };
+    } catch {
+      this.deleteDeviceLogin(id);
+      return jsonError(502, "device_login_failed", "ChatGPT returned incomplete credentials");
+    }
+
+    const stored = await this.storeAccount(tokens, row.label, "unknown", id);
+    return json({
+      status: "complete",
+      account: { id: stored.id, accountId: tokens.accountId, label: row.label, state: "unknown", enabled: true }
+    }, stored.existed ? 200 : 201);
+  }
+
+  private deviceLoginPending(delayMs: number): Response {
+    const retryAfter = Math.max(1, Math.ceil(delayMs / 1000));
+    return json({ status: "pending", retryAfter }, 202, { "retry-after": String(retryAfter) });
+  }
+
+  private releaseDeviceLoginPoll(id: string, intervalSeconds: number): void {
+    const seconds = Math.max(1, Math.min(30, Math.ceil(intervalSeconds)));
+    this.state.storage.transactionSync(() => {
+      this.sql.exec(
+        "UPDATE oauth_device_logins SET polling_until = '', next_poll_at = ? WHERE id = ?",
+        new Date(Date.now() + seconds * 1000).toISOString(),
+        id
+      );
+    });
+  }
+
+  private deleteDeviceLogin(id: string): void {
+    this.state.storage.transactionSync(() => this.sql.exec("DELETE FROM oauth_device_logins WHERE id = ?", id));
+  }
+
+  private pruneDeviceLogins(now = new Date().toISOString()): void {
+    this.sql.exec("DELETE FROM oauth_device_logins WHERE expires_at <= ?", now);
+  }
+
+  private async storeAccount(
+    tokens: AuthImportTokens,
+    label: string,
+    state: AccountRecord["state"],
+    consumedDeviceLoginId = ""
+  ): Promise<{ id: string; existed: boolean }> {
     const key = await this.masterKey;
     const [accessToken, refreshToken, idToken] = await Promise.all([
       encryptSecret(key, tokens.accessToken),
@@ -352,25 +620,17 @@ export class PoolCoordinator {
       encryptSecret(key, tokens.idToken)
     ]);
     const now = new Date().toISOString();
-    const existing = this.sql
-      .exec<{ id: string }>("SELECT id FROM accounts WHERE account_id = ?", tokens.accountId)
-      .toArray()[0];
+    const existing = this.sql.exec<{ id: string }>("SELECT id FROM accounts WHERE account_id = ?", tokens.accountId).toArray()[0];
     const accountId = existing?.id ?? randomId("acct");
     this.state.storage.transactionSync(() => {
       if (existing) {
         this.sql.exec(
           `UPDATE accounts
-              SET label = ?, access_token = ?, refresh_token = ?, id_token = ?, state = 'ok',
+              SET label = ?, access_token = ?, refresh_token = ?, id_token = ?, state = ?,
                   credential_version = credential_version + 1, last_refreshed_at = ?,
                   cooldown_until = '', next_probe_at = '', enabled = 1, updated_at = ?
             WHERE id = ?`,
-          text(input.label),
-          accessToken,
-          refreshToken,
-          idToken,
-          now,
-          now,
-          accountId
+          label, accessToken, refreshToken, idToken, state, now, now, accountId
         );
         this.sql.exec("DELETE FROM usage_current WHERE account_id = ?", accountId);
       } else {
@@ -378,38 +638,24 @@ export class PoolCoordinator {
           `INSERT INTO accounts
              (id, label, account_id, access_token, refresh_token, id_token, state,
               credential_version, last_refreshed_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'ok', 1, ?, ?, ?)`,
-          accountId,
-          text(input.label),
-          tokens.accountId,
-          accessToken,
-          refreshToken,
-          idToken,
-          now,
-          now,
-          now
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+          accountId, label, tokens.accountId, accessToken, refreshToken, idToken, state, now, now, now
         );
       }
-      const position = this.sql
-        .exec<{ position: number }>(
-          "SELECT COALESCE(MAX(position), -1) + 1 AS position FROM group_members WHERE group_id = ?",
-          DEFAULT_GROUP_ID
-        )
-        .one();
+      const position = this.sql.exec<{ position: number }>(
+        "SELECT COALESCE(MAX(position), -1) + 1 AS position FROM group_members WHERE group_id = ?",
+        DEFAULT_GROUP_ID
+      ).one();
       this.sql.exec(
         "INSERT OR IGNORE INTO group_members (group_id, account_id, position, weight) VALUES (?, ?, ?, 1)",
         DEFAULT_GROUP_ID,
         accountId,
         Number(position.position)
       );
+      if (consumedDeviceLoginId) this.sql.exec("DELETE FROM oauth_device_logins WHERE id = ?", consumedDeviceLoginId);
     });
     await this.scheduleNextAlarm();
-    return json(
-      {
-        account: { id: accountId, accountId: tokens.accountId, label: text(input.label), state: "ok", enabled: true }
-      },
-      existing ? 200 : 201
-    );
+    return { id: accountId, existed: Boolean(existing) };
   }
 
   private async updateAccount(request: Request, id: string): Promise<Response> {

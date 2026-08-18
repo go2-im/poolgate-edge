@@ -31,14 +31,14 @@ Exit gate: deterministic tests cover selection and two-account failover.
 
 ## Phase 2 — credential correctness
 
-Status: refresh single-flight, version CAS, journal validation, and injected write/commit/cleanup failure tests are implemented locally. Remote R2 interruption and real rotating-token tests remain pending.
+Status: refresh single-flight, version CAS, journal validation, official device-code account sign-in, and injected write/commit/cleanup failure tests are implemented locally. Remote R2 interruption and real rotating-token tests remain pending.
 
 - Pinned OAuth refresh endpoint and client ID.
 - Per-account refresh promise coalescing.
 - Authoritative credential re-read.
 - R2 pending-rotation journal.
 - Credential-version CAS and startup/request reconciliation.
-- Manual-paste OAuth flow adapted from the latest upstream implementation.
+- Official Codex device-code OAuth flow, polled by short Admin requests rather than a long-running Worker request.
 
 Exit gate: concurrent 401s cause one refresh, and injected failures at every journal/commit boundary recover without reusing the old token.
 
@@ -59,7 +59,7 @@ Exit gate: repeated connect, reconnect, close, and injected upstream failure tes
 
 - Reuse the existing React visual language where practical.
 - Cloudflare Access identity display.
-- Account import, non-secret editing, and non-destructive disable/enable. Account deletion remains pending explicit destructive-action design and confirmation.
+- Device-code sign-in, manual account import, non-secret editing, and non-destructive disable/enable. Account deletion remains pending explicit destructive-action design and confirmation.
 - Policy group create/edit with stable member ordering, endpoint create/rebind, and API-key create/edit/regenerate/revoke with optional IP/CIDR restrictions are implemented locally. Destructive group/endpoint deletion remains intentionally deferred.
 - Current state and quota display only.
 - Client configuration generator.
