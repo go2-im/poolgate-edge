@@ -1,0 +1,47 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "poolgate-edge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-18",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "ENVIRONMENT": "production",
+    "ADMIN_HOST": "admin.poolgate.example.com",
+    "PROXY_HOST": "api.poolgate.example.com",
+    "ADMIN_AUTH_MODE": "access",
+    "ACCESS_TEAM_DOMAIN": "https://your-team.cloudflareaccess.com",
+    "ACCESS_AUD": "replace-with-access-application-aud-tag",
+    "UPSTREAM_BASE": "https://chatgpt.com/backend-api/codex",
+    "OAUTH_ISSUER": "https://auth.openai.com/oauth/token",
+    "OAUTH_CLIENT_ID": "app_EMoamEEZ73f0CkXaXp7hrann",
+    "MAX_REQUEST_BODY_BYTES": "8388608"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "POOL",
+        "class_name": "PoolCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PoolCoordinator"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ROTATION_JOURNAL",
+      "bucket_name": "poolgate-edge-rotation-journal"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "none",
+    "not_found_handling": "none"
+  }
+}

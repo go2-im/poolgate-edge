@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#15382f" />
+    <title>Poolgate Edge</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <a class="brand" href="#overview" aria-label="Poolgate Edge home">
+          <span class="brand-mark" aria-hidden="true">P</span>
+          <span><strong>Poolgate</strong><small>EDGE</small></span>
+        </a>
+        <nav aria-label="Primary navigation">
+          <a class="nav-item active" href="#overview">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z" /></svg>
+            Overview
+          </a>
+          <a class="nav-item" href="#accounts">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 8a7 7 0 0 1 14 0H5Z" /></svg>
+            Accounts
+          </a>
+          <a class="nav-item" href="#routing">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm14 10a3 3 0 1 0 0 6 3 3 0 0 0 0-6ZM5 14a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm2-7h4a4 4 0 0 1 4 4v1.17A3 3 0 0 0 13 15v1h3v-1a6 6 0 0 1 3-5.48V8a1 1 0 0 0-1-1H7Z" /></svg>
+            Routing
+          </a>
+          <a class="nav-item" href="#api-keys">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 3a6.5 6.5 0 0 0-6.28 8.17L3 16.38V21h4.62l1.5-1.5H12V17h2.5l1.33-1.33A6.5 6.5 0 1 0 14.5 3Zm0 4a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5Z" /></svg>
+            API keys
+          </a>
+        </nav>
+        <div class="access-card">
+          <span class="access-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M7 10V8a5 5 0 0 1 10 0v2h1a2 2 0 0 1 2 2v7H4v-7a2 2 0 0 1 2-2h1Zm2 0h6V8a3 3 0 0 0-6 0v2Z" /></svg>
+          </span>
+          <div><strong>Admin protected</strong><span id="access-identity">Cloudflare Access</span></div>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div><p class="eyebrow">PERSONAL EDGE GATEWAY</p><h1>Pool overview</h1></div>
+          <div class="service-state" id="service-state" data-state="loading">
+            <span class="state-dot" aria-hidden="true"></span><span id="service-state-text">Connecting</span>
+          </div>
+        </header>
+
+        <section id="overview" aria-labelledby="overview-title">
+          <div class="section-heading">
+            <div><h2 id="overview-title">At a glance</h2><p>Live configuration from the pool coordinator.</p></div>
+            <span class="updated" id="updated">Not loaded yet</span>
+          </div>
+          <div class="metrics" aria-live="polite">
+            <article class="metric primary"><span class="metric-label">Accounts</span><strong id="account-count">—</strong><span class="metric-note">Credentials in this pool</span></article>
+            <article class="metric"><span class="metric-label">Endpoints</span><strong id="endpoint-count">—</strong><span class="metric-note">Available proxy routes</span></article>
+            <article class="metric"><span class="metric-label">Proxy keys</span><strong id="api-key-count">—</strong><span class="metric-note">Explicitly issued credentials</span></article>
+            <article class="metric"><span class="metric-label">Schema</span><strong id="schema-version">—</strong><span class="metric-note">Durable Object database</span></article>
+          </div>
+        </section>
+
+        <section class="workspace" id="accounts" aria-labelledby="accounts-title">
+          <div class="account-panel">
+            <div class="section-heading compact">
+              <div><p class="eyebrow">ACCOUNT POOL</p><h2 id="accounts-title">Connected accounts</h2></div>
+              <button class="icon-button" id="refresh" type="button" title="Refresh accounts" aria-label="Refresh accounts">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.4 5.6A9 9 0 1 0 21 12h-2a7 7 0 1 1-2.05-4.95L14 10h7V3l-2.6 2.6Z" /></svg>
+              </button>
+            </div>
+            <div class="account-list" id="account-list" aria-live="polite">
+              <div class="empty-state"><span class="empty-icon" aria-hidden="true">···</span><strong>Loading accounts</strong><p>Reading the current pool state.</p></div>
+            </div>
+          </div>
+
+          <aside class="import-panel">
+            <div class="panel-number" aria-hidden="true">01</div>
+            <p class="eyebrow">ADD CREDENTIALS</p>
+            <h2>Import an account</h2>
+            <p class="panel-intro">Paste a Codex <code>auth.json</code>. Tokens are encrypted before they enter Durable Object storage.</p>
+            <form id="import-form">
+              <label for="label">Account label <span>Optional</span></label>
+              <input id="label" name="label" autocomplete="off" placeholder="Personal Pro" />
+              <label for="content">auth.json</label>
+              <textarea id="content" name="content" required spellcheck="false" placeholder='{"tokens":{"access_token":"…"}}'></textarea>
+              <button class="primary-button" id="import-button" type="submit">
+                <span>Import account</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 5 7 7-7 7-1.4-1.4 4.6-4.6H4v-2h12.2l-4.6-4.6L13 5Z" /></svg>
+              </button>
+              <p class="form-message" id="form-message" role="status"></p>
+            </form>
+          </aside>
+        </section>
+
+        <section id="routing" aria-labelledby="routing-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">TRAFFIC CONTROL</p><h2 id="routing-title">Routing policies</h2><p>Bind named endpoints to reusable account-selection policies.</p></div>
+          </div>
+          <div class="routing-grid">
+            <article class="route-panel">
+              <h2>Policy groups</h2>
+              <p class="section-copy">Choose the accounts and selection strategy used for a request.</p>
+              <form id="policy-form" class="compact-form">
+                <label for="policy-name">Group name</label>
+                <input id="policy-name" maxlength="80" required autocomplete="off" placeholder="Balanced pool" />
+                <label for="policy-strategy">Strategy</label>
+                <select id="policy-strategy">
+                  <option value="fallback">Fallback</option>
+                  <option value="best-quota">Best quota</option>
+                  <option value="load-balance">Load balance</option>
+                  <option value="weighted">Weighted</option>
+                </select>
+                <label>Members <span>Weight applies to weighted strategy</span></label>
+                <div class="member-choices" id="policy-members"></div>
+                <button class="primary-button" id="policy-create-button" type="submit"><span>Create policy group</span></button>
+                <p class="form-message" id="policy-message" role="status"></p>
+              </form>
+              <div class="route-list" id="policy-group-list"></div>
+            </article>
+
+            <article class="route-panel">
+              <h2>Endpoints</h2>
+              <p class="section-copy">Each endpoint exposes one policy at a stable Proxy URL.</p>
+              <form id="endpoint-form" class="compact-form">
+                <label for="endpoint-name">Endpoint name</label>
+                <input id="endpoint-name" maxlength="64" pattern="[A-Za-z0-9._-]+" required autocomplete="off" placeholder="team-a" />
+                <label for="endpoint-group">Policy group</label>
+                <select id="endpoint-group"></select>
+                <button class="primary-button" id="endpoint-create-button" type="submit"><span>Create endpoint</span></button>
+                <p class="form-message" id="endpoint-message" role="status"></p>
+              </form>
+              <div class="route-list" id="endpoint-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="workspace key-workspace" id="api-keys" aria-labelledby="api-keys-title">
+          <div class="account-panel">
+            <div class="section-heading compact">
+              <div><p class="eyebrow">PROXY ACCESS</p><h2 id="api-keys-title">Proxy API keys</h2></div>
+            </div>
+            <p class="section-copy">No key is created when an account is imported. Create one here only when a client is ready to connect.</p>
+            <div class="account-list" id="api-key-list" aria-live="polite">
+              <div class="empty-state"><span class="empty-icon" aria-hidden="true">···</span><strong>Loading API keys</strong><p>Reading explicitly issued credentials.</p></div>
+            </div>
+            <div class="client-config">
+              <p class="eyebrow">CLIENT CONFIGURATION</p>
+              <h2>Generate a connection snippet</h2>
+              <p class="section-copy">Paste a key locally to build an OpenAI-compatible base URL and request example. The value stays in this browser and is never sent to Poolgate.</p>
+              <div class="config-fields">
+                <div><label for="config-endpoint">Endpoint</label><select id="config-endpoint"></select></div>
+                <div><label for="config-key">API key <span>Optional</span></label><input id="config-key" type="password" autocomplete="off" placeholder="sk-pg-…" /></div>
+              </div>
+              <pre class="config-snippet" id="config-snippet"></pre>
+              <div class="config-actions">
+                <button class="regenerate-button" id="copy-config" type="button">Copy configuration</button>
+                <button class="revoke-button" id="clear-config" type="button">Clear key</button>
+              </div>
+              <p class="form-message" id="config-message" role="status"></p>
+            </div>
+          </div>
+
+          <aside class="import-panel">
+            <div class="panel-number" aria-hidden="true">02</div>
+            <p class="eyebrow">AUTHORIZE A CLIENT</p>
+            <h2>Create a Proxy key</h2>
+            <p class="panel-intro">The plaintext is shown once. Poolgate stores only its SHA-256 hash.</p>
+            <form id="key-form">
+              <label for="key-label">Key label</label>
+              <input id="key-label" name="key-label" required autocomplete="off" placeholder="Local Codex" />
+              <label for="key-expiry">Expiration</label>
+              <select id="key-expiry" name="key-expiry">
+                <option value="">Never</option>
+                <option value="30">30 days</option>
+                <option value="90">90 days</option>
+                <option value="365">1 year</option>
+              </select>
+              <label for="key-endpoint">Endpoint scope</label>
+              <select id="key-endpoint" name="key-endpoint"></select>
+              <label for="key-ip-allowlist">IP allowlist <span>Optional</span></label>
+              <input id="key-ip-allowlist" name="key-ip-allowlist" autocomplete="off" placeholder="203.0.113.7, 2001:db8::/32" />
+              <p class="scope-note">Comma or space separated. Empty allows any client IP.</p>
+              <button class="primary-button" id="create-key-button" type="submit">
+                <span>Create Proxy key</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 5 7 7-7 7-1.4-1.4 4.6-4.6H4v-2h12.2l-4.6-4.6L13 5Z" /></svg>
+              </button>
+              <p class="form-message" id="key-form-message" role="status"></p>
+            </form>
+          </aside>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="key-dialog" aria-labelledby="key-title">
+      <button class="dialog-close" id="dialog-close" type="button" aria-label="Close">×</button>
+      <span class="key-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M14.5 3a6.5 6.5 0 0 0-6.28 8.17L3 16.38V21h4.62l1.5-1.5H12V17h2.5l1.33-1.33A6.5 6.5 0 1 0 14.5 3Zm0 4a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5Z" /></svg></span>
+      <p class="eyebrow">NEW PROXY API KEY</p>
+      <h2 id="key-title">Save this key now</h2>
+      <p>This key authenticates Codex clients on the Proxy hostname. It is not an Admin login and will not be shown again.</p>
+      <code class="key-value" id="key-value"></code>
+      <button class="copy-button" id="copy-key" type="button">Copy API key</button>
+    </dialog>
+
+    <dialog id="account-dialog" aria-labelledby="account-dialog-title">
+      <button class="dialog-close" id="account-dialog-close" type="button" aria-label="Close">×</button>
+      <p class="eyebrow">ACCOUNT SETTINGS</p>
+      <h2 id="account-dialog-title">Edit account</h2>
+      <p>Set a recognizable label and an optional per-account concurrency limit. Zero means unlimited.</p>
+      <form id="account-edit-form">
+        <label for="account-edit-label">Account label</label>
+        <input id="account-edit-label" maxlength="80" autocomplete="off" />
+        <label for="account-edit-cap">Concurrency limit</label>
+        <input id="account-edit-cap" type="number" min="0" max="100" step="1" required />
+        <button class="primary-button" id="account-save-button" type="submit"><span>Save account</span></button>
+        <p class="form-message" id="account-edit-message" role="status"></p>
+      </form>
+    </dialog>
+
+    <dialog id="key-edit-dialog" aria-labelledby="key-edit-title">
+      <button class="dialog-close" id="key-edit-dialog-close" type="button" aria-label="Close">×</button>
+      <p class="eyebrow">PROXY KEY SETTINGS</p>
+      <h2 id="key-edit-title">Edit API key</h2>
+      <p>Update non-secret metadata only. The existing key value and hash stay unchanged.</p>
+      <form id="key-edit-form">
+        <label for="key-edit-label">Key label</label>
+        <input id="key-edit-label" maxlength="80" required autocomplete="off" />
+        <label for="key-edit-endpoint">Endpoint scope</label>
+        <select id="key-edit-endpoint"></select>
+        <label for="key-edit-ip-allowlist">IP allowlist <span>Optional</span></label>
+        <input id="key-edit-ip-allowlist" autocomplete="off" placeholder="203.0.113.7, 2001:db8::/32" />
+        <p class="scope-note">Empty allows any client IP. Invalid or unavailable client IPs are denied when rules exist.</p>
+        <label for="key-edit-expiry">Expiration</label>
+        <select id="key-edit-expiry">
+          <option value="__keep__">Keep current expiration</option>
+          <option value="">Never</option>
+          <option value="30">30 days from now</option>
+          <option value="90">90 days from now</option>
+          <option value="365">1 year from now</option>
+        </select>
+        <button class="primary-button" id="key-edit-save-button" type="submit"><span>Save key settings</span></button>
+        <p class="form-message" id="key-edit-message" role="status"></p>
+      </form>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+# Generate with: openssl rand -base64 32
+MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
+ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+ACCESS_AUD=replace-with-access-application-aud-tag
