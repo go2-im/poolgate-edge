@@ -367,12 +367,16 @@ export class PoolCoordinator {
 
   private async importAccount(request: Request): Promise<Response> {
     const bytes = await request.arrayBuffer();
-    if (bytes.byteLength > MAX_ADMIN_BODY_BYTES) return jsonError(413, "body_too_large", "import body exceeds 1 MiB");
+    if (bytes.byteLength > MAX_ADMIN_BODY_BYTES) {
+      console.warn("account import rejected", { reason: "body_too_large", bytes: bytes.byteLength });
+      return jsonError(413, "body_too_large", "import body exceeds 1 MiB");
+    }
 
     let input: ImportRequest;
     try {
       input = JSON.parse(new TextDecoder().decode(bytes)) as ImportRequest;
     } catch {
+      console.warn("account import rejected", { reason: "invalid_json", bytes: bytes.byteLength });
       return jsonError(400, "invalid_json", "request body must be JSON");
     }
 
@@ -380,12 +384,32 @@ export class PoolCoordinator {
     try {
       tokens = parseAuthJson(text(input.content) || text(input.authJson));
     } catch (error) {
+      console.warn("account import rejected", {
+        reason: "invalid_auth_file",
+        bytes: bytes.byteLength,
+        detail: error instanceof Error ? error.message : "invalid auth.json"
+      });
       return jsonError(400, "invalid_auth_file", error instanceof Error ? error.message : "invalid auth.json");
     }
 
     const label = text(input.label);
-    if (label.length > 80) return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
-    const stored = await this.storeAccount(tokens, label, "ok");
+    if (label.length > 80) {
+      console.warn("account import rejected", { reason: "invalid_label", labelLength: label.length });
+      return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
+    }
+    console.log("account import started", {
+      bytes: bytes.byteLength,
+      labelLength: label.length,
+      hasIdToken: Boolean(tokens.idToken)
+    });
+    let stored;
+    try {
+      stored = await this.storeAccount(tokens, label, "ok");
+    } catch {
+      console.error("account import failed", { stage: "store_account" });
+      throw new Error("account import storage failed");
+    }
+    console.log("account import completed", { existed: stored.existed });
     return json(
       {
         account: { id: stored.id, accountId: tokens.accountId, label, state: "ok", enabled: true }
@@ -398,6 +422,7 @@ export class PoolCoordinator {
     try {
       assertPinnedOAuthIssuer(this.env.OAUTH_ISSUER);
     } catch {
+      console.error("device login failed", { stage: "validate_oauth_configuration" });
       return jsonError(503, "oauth_misconfigured", "OAuth login is not configured safely");
     }
     const parsed = await this.readAdminJson<DeviceLoginStartRequest>(request);
@@ -406,6 +431,7 @@ export class PoolCoordinator {
     if (label.length > 80) return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
 
     this.pruneDeviceLogins();
+    console.log("device login started", { labelLength: label.length });
     let response: Response;
     try {
       response = await fetch(DEVICE_USER_CODE_URL, {
@@ -415,17 +441,23 @@ export class PoolCoordinator {
         redirect: "error"
       });
     } catch {
+      console.error("device login failed", { stage: "request_user_code", reason: "upstream_fetch_error" });
       return jsonError(502, "device_login_failed", "could not reach ChatGPT sign-in");
     }
     if (response.status === 404) {
+      console.warn("device login unavailable", { stage: "request_user_code", upstreamStatus: response.status });
       return jsonError(503, "device_login_unavailable", "device-code login is not enabled; import auth.json instead");
     }
-    if (!response.ok) return jsonError(502, "device_login_failed", "could not start ChatGPT sign-in");
+    if (!response.ok) {
+      console.error("device login failed", { stage: "request_user_code", upstreamStatus: response.status });
+      return jsonError(502, "device_login_failed", "could not start ChatGPT sign-in");
+    }
 
     let started;
     try {
       started = parseDeviceCodeStart(await response.json());
     } catch {
+      console.error("device login failed", { stage: "parse_user_code_response" });
       return jsonError(502, "device_login_failed", "ChatGPT returned an invalid sign-in response");
     }
     const key = await this.masterKey;
@@ -460,6 +492,7 @@ export class PoolCoordinator {
         createdAt.toISOString()
       );
     });
+    console.log("device login code issued", { intervalSeconds: started.intervalSeconds });
     return json({
       loginId: id,
       verificationUrl: DEVICE_VERIFICATION_URL,
