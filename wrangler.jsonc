@@ -35,5 +35,8 @@
     "run_worker_first": true,
     "html_handling": "none",
     "not_found_handling": "none"
+  },
+  "placement": {
+    "region": "aws:ap-northeast-1"
   }
 }
