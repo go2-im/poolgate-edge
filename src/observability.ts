@@ -19,10 +19,20 @@ export function errorReason(error: unknown): string {
 }
 
 export async function upstreamErrorFields(response: Response): Promise<Record<string, LogField>> {
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0] || "unknown";
+  const mitigation = response.headers.get("cf-mitigated")?.trim().toLowerCase() ?? "";
+  const server = response.headers.get("server")?.trim() ?? "";
+  const ray = response.headers.get("cf-ray")?.trim() ?? "";
   const fields: Record<string, LogField> = {
     upstreamStatus: response.status,
-    upstreamContentType: response.headers.get("content-type")?.split(";", 1)[0] || "unknown"
+    upstreamContentType: contentType
   };
+  if (mitigation === "challenge") fields.upstreamMitigation = "challenge";
+  if (server) fields.upstreamServer = redactLogText(server, 100);
+  if (ray) fields.upstreamRay = redactLogText(ray, 100);
+  if (contentType === "text/html") {
+    fields.upstreamResponseKind = mitigation === "challenge" ? "cloudflare_challenge" : "html_error";
+  }
   try {
     const body = (await response.clone().text()).trim();
     if (!body) return fields;
