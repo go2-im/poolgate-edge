@@ -41,6 +41,7 @@ import {
   parseUsagePayload,
   type CurrentUsage
 } from "./usage";
+import { logUsagePoll, type UsagePollSource } from "./usage-log";
 import { normalizeClose, webSocketMessageBytes } from "./websocket";
 
 const DEFAULT_GROUP_ID = "group_default";
@@ -255,9 +256,12 @@ export class PoolCoordinator {
       .toArray();
     for (const account of due) {
       try {
-        await this.pollAccountUsage(account.id);
+        await this.pollAccountUsage(account.id, "scheduled");
       } catch (error) {
-        console.warn("scheduled usage poll failed", account.id, error instanceof Error ? error.message : "unknown error");
+        const accountRef = (await sha256Hex(account.id)).slice(0, 12);
+        logUsagePoll("error", "scheduled", "unhandled_exception", "failed", {
+          accountRef, error: errorReason(error)
+        });
         this.deferProbe(account.id);
       }
     }
@@ -318,7 +322,7 @@ export class PoolCoordinator {
     }
     const accountProbeMatch = /^\/admin\/api\/accounts\/([A-Za-z0-9_]+)\/probe$/.exec(url.pathname);
     if (request.method === "POST" && accountProbeMatch) {
-      const result = await this.pollAccountUsage(accountProbeMatch[1]);
+      const result = await this.pollAccountUsage(accountProbeMatch[1], "manual");
       return result instanceof Response ? result : json({ usage: result });
     }
     if (request.method === "GET" && url.pathname === "/admin/api/policy-groups") {
@@ -1828,18 +1832,43 @@ export class PoolCoordinator {
     return JSON.parse(new TextDecoder().decode(body)) as unknown;
   }
 
-  private async pollAccountUsage(accountId: string): Promise<CurrentUsage | Response> {
+  private async pollAccountUsage(accountId: string, source: UsagePollSource): Promise<CurrentUsage | Response> {
+    const startedAt = Date.now();
+    const accountRef = (await sha256Hex(accountId)).slice(0, 12);
+    logUsagePoll("log", source, "request_received", "started", { accountRef });
     const row = this.sql.exec<AccountRow>("SELECT * FROM accounts WHERE id = ?", accountId).toArray()[0];
-    if (!row) return jsonError(404, "not_found", "account not found");
-    if (!row.enabled) return jsonError(409, "account_disabled", "disabled account cannot be probed");
+    if (!row) {
+      logUsagePoll("warn", source, "account_validation", "failed", {
+        accountRef, reason: "not_found"
+      });
+      return jsonError(404, "not_found", "account not found");
+    }
+    if (!row.enabled) {
+      logUsagePoll("warn", source, "account_validation", "failed", {
+        accountRef, reason: "disabled"
+      });
+      return jsonError(409, "account_disabled", "disabled account cannot be probed");
+    }
     if (row.state === "revoked" || row.state === "dead") {
+      logUsagePoll("warn", source, "account_validation", "failed", {
+        accountRef, reason: "terminal_state", accountState: row.state
+      });
       return jsonError(409, "account_not_probeable", "terminal account cannot be probed");
     }
 
-    let credentials = await this.decryptAccount(rowToAccount(row));
+    let credentials: DecryptedAccount;
+    try {
+      credentials = await this.decryptAccount(rowToAccount(row));
+    } catch (error) {
+      logUsagePoll("error", source, "decrypt_credentials", "failed", {
+        accountRef, error: errorReason(error)
+      });
+      throw error;
+    }
     let refreshed = false;
     for (;;) {
       let response: Response;
+      logUsagePoll("log", source, "fetch_usage", "progress", { accountRef, refreshed });
       try {
         response = await fetch(this.usageUrl(), {
           method: "GET",
@@ -1847,22 +1876,41 @@ export class PoolCoordinator {
           redirect: SAFE_FETCH_REDIRECT,
           signal: AbortSignal.timeout(USAGE_REQUEST_TIMEOUT_MS)
         });
-      } catch {
+      } catch (error) {
+        logUsagePoll("error", source, "fetch_usage", "failed", {
+          accountRef,
+          refreshed,
+          reason: error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "upstream_fetch_error",
+          error: errorReason(error),
+          durationMs: Date.now() - startedAt
+        });
         this.deferProbe(accountId);
         return jsonError(502, "usage_unavailable", "account usage is temporarily unavailable");
       }
 
       if (response.status === 401) {
+        const upstream = await upstreamErrorFields(response);
         response.body?.cancel().catch(() => undefined);
         if (refreshed) {
+          logUsagePoll("error", source, "authorize_usage", "failed", {
+            accountRef, reason: "unauthorized_after_refresh", ...upstream
+          });
           this.markState(accountId, "expired", "");
           return jsonError(502, "account_authorization_expired", "account authorization expired after refresh");
         }
+        logUsagePoll("warn", source, "authorize_usage", "progress", {
+          accountRef, reason: "unauthorized_refreshing", ...upstream
+        });
         try {
           credentials = await this.refreshAccount(accountId, credentials.credentialVersion);
           refreshed = true;
+          logUsagePoll("log", source, "refresh_credentials", "completed", { accountRef });
           continue;
         } catch (error) {
+          const terminal = error instanceof OAuthRefreshFailure && error.terminal;
+          logUsagePoll("error", source, "refresh_credentials", "failed", {
+            accountRef, terminal, error: errorReason(error)
+          });
           if (error instanceof OAuthRefreshFailure && error.terminal) {
             this.markState(accountId, "expired", "");
             return jsonError(502, "account_authorization_expired", "account authorization expired");
@@ -1873,12 +1921,21 @@ export class PoolCoordinator {
       }
 
       if (response.status === 429) {
-        const until = new Date(Date.now() + retryAfter(response, MAX_USAGE_RETRY_AFTER_MS)).toISOString();
+        const retryAfterMs = retryAfter(response, MAX_USAGE_RETRY_AFTER_MS);
+        const upstream = await upstreamErrorFields(response);
+        const until = new Date(Date.now() + retryAfterMs).toISOString();
+        logUsagePoll("warn", source, "fetch_usage", "failed", {
+          accountRef, reason: "rate_limited", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstream
+        });
         response.body?.cancel().catch(() => undefined);
         this.markState(accountId, "cooldown", until);
         return jsonError(502, "usage_rate_limited", "account usage polling is temporarily rate limited");
       }
       if (!response.ok) {
+        const upstream = await upstreamErrorFields(response);
+        logUsagePoll("error", source, "fetch_usage", "failed", {
+          accountRef, reason: "upstream_rejected", ...upstream, durationMs: Date.now() - startedAt
+        });
         response.body?.cancel().catch(() => undefined);
         this.deferProbe(accountId);
         return jsonError(502, "usage_unavailable", "account usage is temporarily unavailable");
@@ -1887,7 +1944,10 @@ export class PoolCoordinator {
       let parsed: ReturnType<typeof parseUsagePayload>;
       try {
         parsed = parseUsagePayload(await this.readUsageJson(response));
-      } catch {
+      } catch (error) {
+        logUsagePoll("error", source, "parse_usage_response", "failed", {
+          accountRef, error: errorReason(error), durationMs: Date.now() - startedAt
+        });
         this.deferProbe(accountId);
         return jsonError(502, "invalid_usage_response", "account usage response is invalid");
       }
@@ -1901,8 +1961,18 @@ export class PoolCoordinator {
           accountId
         )
         .toArray()[0];
-      if (!current) return jsonError(404, "not_found", "account not found");
-      if (!current.enabled) return jsonError(409, "account_disabled", "account was disabled during the usage check");
+      if (!current) {
+        logUsagePoll("warn", source, "persist_usage", "failed", {
+          accountRef, reason: "account_deleted_during_poll"
+        });
+        return jsonError(404, "not_found", "account not found");
+      }
+      if (!current.enabled) {
+        logUsagePoll("warn", source, "persist_usage", "failed", {
+          accountRef, reason: "account_disabled_during_poll"
+        });
+        return jsonError(409, "account_disabled", "account was disabled during the usage check");
+      }
       const currentGate = Date.parse(current.cooldown_until);
       let nextState: AccountRecord["state"] = "ok";
       let cooldownUntil = "";
@@ -1920,27 +1990,42 @@ export class PoolCoordinator {
         nextProbeAt = current.cooldown_until;
       }
 
-      this.state.storage.transactionSync(() => {
-        this.sql.exec(
-          `INSERT INTO usage_current (account_id, plan_type, windows, captured_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(account_id) DO UPDATE SET
-             plan_type = excluded.plan_type, windows = excluded.windows, captured_at = excluded.captured_at`,
-          accountId,
-          parsed.planType,
-          JSON.stringify(parsed.windows),
-          capturedAt
-        );
-        this.sql.exec(
-          "UPDATE accounts SET state = ?, cooldown_until = ?, next_probe_at = ?, updated_at = ? WHERE id = ?",
-          nextState,
-          cooldownUntil,
-          nextProbeAt,
-          capturedAt,
-          accountId
-        );
+      try {
+        this.state.storage.transactionSync(() => {
+          this.sql.exec(
+            `INSERT INTO usage_current (account_id, plan_type, windows, captured_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_id) DO UPDATE SET
+               plan_type = excluded.plan_type, windows = excluded.windows, captured_at = excluded.captured_at`,
+            accountId,
+            parsed.planType,
+            JSON.stringify(parsed.windows),
+            capturedAt
+          );
+          this.sql.exec(
+            "UPDATE accounts SET state = ?, cooldown_until = ?, next_probe_at = ?, updated_at = ? WHERE id = ?",
+            nextState,
+            cooldownUntil,
+            nextProbeAt,
+            capturedAt,
+            accountId
+          );
+        });
+        await this.scheduleNextAlarm();
+      } catch (error) {
+        logUsagePoll("error", source, "persist_usage", "failed", {
+          accountRef, error: errorReason(error)
+        });
+        throw error;
+      }
+      logUsagePoll("log", source, "complete", "completed", {
+        accountRef,
+        durationMs: Date.now() - startedAt,
+        planType: parsed.planType,
+        windowCount: parsed.windows.length,
+        headroom,
+        accountState: nextState
       });
-      await this.scheduleNextAlarm();
       return { ...parsed, capturedAt, headroom };
     }
   }
