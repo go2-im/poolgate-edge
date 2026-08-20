@@ -2168,8 +2168,9 @@ export class PoolCoordinator {
       }
       if (!response.ok) {
         const upstream = await upstreamErrorFields(response);
+        const reason = upstream.upstreamMitigation === "challenge" ? "upstream_challenge" : "upstream_rejected";
         usageLog("error", "fetch_usage", "failed", {
-          reason: "upstream_rejected", ...upstream, durationMs: Date.now() - startedAt
+          reason, ...upstream, durationMs: Date.now() - startedAt
         });
         response.body?.cancel().catch(() => undefined);
         this.deferProbe(accountId);

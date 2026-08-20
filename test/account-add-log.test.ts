@@ -55,4 +55,26 @@ describe("account-add logging", () => {
     });
     expect(JSON.stringify(fields)).not.toContain("must-not-appear");
   });
+
+  it("classifies Cloudflare HTML challenge responses from safe headers", async () => {
+    const fields = await upstreamErrorFields(new Response("<html>secret challenge body</html>", {
+      status: 403,
+      headers: {
+        "content-type": "text/html; charset=UTF-8",
+        "cf-mitigated": "challenge",
+        "cf-ray": "abc123-SJC",
+        server: "cloudflare"
+      }
+    }));
+
+    expect(fields).toEqual({
+      upstreamStatus: 403,
+      upstreamContentType: "text/html",
+      upstreamMitigation: "challenge",
+      upstreamServer: "cloudflare",
+      upstreamRay: "abc123-SJC",
+      upstreamResponseKind: "cloudflare_challenge"
+    });
+    expect(JSON.stringify(fields)).not.toContain("secret challenge body");
+  });
 });
