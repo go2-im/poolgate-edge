@@ -1,7 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { exhaustedReset, headroomFromStoredWindows, minimumHeadroom, parseStoredUsage, parseUsagePayload } from "../src/usage";
+import {
+  exhaustedReset,
+  headroomFromStoredWindows,
+  minimumHeadroom,
+  parseStoredUsage,
+  parseUsagePayload,
+  usageRouteCandidates
+} from "../src/usage";
 
 describe("usage payload", () => {
+  it("builds the pinned usage fallback routes used by Codex clients", () => {
+    expect(usageRouteCandidates("https://chatgpt.com/backend-api/codex/responses")).toEqual([
+      { name: "backend_api_wham", url: "https://chatgpt.com/backend-api/wham/usage" },
+      { name: "wham", url: "https://chatgpt.com/wham/usage" },
+      { name: "codex_api", url: "https://chatgpt.com/api/codex/usage" }
+    ]);
+  });
+
   it("flattens primary, secondary, and additional windows", () => {
     const parsed = parseUsagePayload({
       plan_type: "plus",
