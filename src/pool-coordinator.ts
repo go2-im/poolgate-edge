@@ -1,6 +1,7 @@
 import { parseAuthJson } from "./auth-import";
 import { errorReason, logAccountAdd, upstreamErrorFields } from "./account-add-log";
 import { decryptSecret, encryptSecret, importMasterKey, newApiKey, randomId, sha256Hex } from "./crypto";
+import { isRedirectStatus, SAFE_FETCH_REDIRECT } from "./fetch-policy";
 import {
   isTerminalOAuthFailure,
   parseRotationJournal,
@@ -468,7 +469,7 @@ export class PoolCoordinator {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ client_id: this.env.OAUTH_CLIENT_ID }),
-        redirect: "error"
+        redirect: SAFE_FETCH_REDIRECT
       });
     } catch (error) {
       logAccountAdd("error", "device_login", "request_user_code", "failed", {
@@ -607,7 +608,7 @@ export class PoolCoordinator {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ device_auth_id: deviceAuthId, user_code: userCode }),
-        redirect: "error"
+        redirect: SAFE_FETCH_REDIRECT
       });
     } catch (error) {
       logAccountAdd("error", "device_login", "poll_device_token", "failed", {
@@ -656,7 +657,7 @@ export class PoolCoordinator {
           client_id: this.env.OAUTH_CLIENT_ID,
           code_verifier: authorization.codeVerifier
         }),
-        redirect: "error"
+        redirect: SAFE_FETCH_REDIRECT
       });
     } catch (error) {
       logAccountAdd("error", "device_login", "exchange_authorization_code", "failed", {
@@ -1446,7 +1447,7 @@ export class PoolCoordinator {
               method: "POST",
               headers: this.upstreamHeaders(request, credentials),
               body: bodyResult,
-              redirect: "error",
+              redirect: SAFE_FETCH_REDIRECT,
               signal: request.signal
             });
           } catch {
@@ -1481,6 +1482,13 @@ export class PoolCoordinator {
           this.markState(account.id, "expired", "");
             lastStatus = 502;
             lastMessage = "account authorization expired";
+            break;
+          }
+          if (isRedirectStatus(upstream.status)) {
+            lastStatus = 502;
+            lastMessage = "upstream redirect rejected";
+            this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
+            upstream.body?.cancel().catch(() => undefined);
             break;
           }
           if (RETRYABLE_STATUS.has(upstream.status)) {
@@ -1530,7 +1538,11 @@ export class PoolCoordinator {
           try {
             const headers = this.upstreamHeaders(request, credentials, "websocket");
             headers.set("upgrade", "websocket");
-            upstreamResponse = await fetch(this.upstreamUrl(), { headers, redirect: "error", signal: request.signal });
+            upstreamResponse = await fetch(this.upstreamUrl(), {
+              headers,
+              redirect: SAFE_FETCH_REDIRECT,
+              signal: request.signal
+            });
           } catch {
             if (request.signal.aborted) {
               return jsonError(408, "request_cancelled", "request was cancelled before the WebSocket handshake committed");
@@ -1560,6 +1572,13 @@ export class PoolCoordinator {
           if (!refreshed) break;
           this.markState(account.id, "expired", "");
             lastMessage = "account authorization expired";
+            break;
+          }
+          if (isRedirectStatus(upstreamResponse.status)) {
+            lastStatus = 502;
+            lastMessage = "upstream WebSocket redirect rejected";
+            this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
+            upstreamResponse.body?.cancel().catch(() => undefined);
             break;
           }
           if (upstreamResponse.status !== 101 || !upstreamResponse.webSocket) {
@@ -1825,7 +1844,7 @@ export class PoolCoordinator {
         response = await fetch(this.usageUrl(), {
           method: "GET",
           headers: this.usageHeaders(credentials),
-          redirect: "error",
+          redirect: SAFE_FETCH_REDIRECT,
           signal: AbortSignal.timeout(USAGE_REQUEST_TIMEOUT_MS)
         });
       } catch {
@@ -2082,7 +2101,7 @@ export class PoolCoordinator {
         refresh_token: before.refreshToken,
         client_id: this.env.OAUTH_CLIENT_ID
       }),
-      redirect: "error"
+      redirect: SAFE_FETCH_REDIRECT
     });
     if (!response.ok) {
       let code = "";
