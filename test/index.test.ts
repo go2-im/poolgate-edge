@@ -37,6 +37,7 @@ describe("outer Worker routing", () => {
   it("maps the Admin root to the explicit index asset", async () => {
     const response = await worker.fetch(new Request("https://admin.example.com/"), testEnv());
     expect(response.status).toBe(200);
+    expect(response.headers.get("x-poolgate-request-id")).toBeTruthy();
     expect(await response.text()).toBe("admin shell");
     expect(response.headers.get("content-security-policy")).toContain("script-src 'self'");
   });
@@ -87,7 +88,8 @@ describe("outer Worker routing", () => {
       get() {
         return {
           fetch: async (request: Request) => new Response(JSON.stringify({
-            clientIp: request.headers.get("x-poolgate-client-ip")
+            clientIp: request.headers.get("x-poolgate-client-ip"),
+            requestId: request.headers.get("x-poolgate-request-id")
           }), { headers: { "content-type": "application/json" } })
         };
       }
@@ -98,7 +100,10 @@ describe("outer Worker routing", () => {
         "x-poolgate-client-ip": "198.51.100.9"
       }
     }), env);
-    await expect(response.json()).resolves.toEqual({ clientIp: "203.0.113.7" });
+    await expect(response.json()).resolves.toEqual({
+      clientIp: "203.0.113.7",
+      requestId: response.headers.get("x-poolgate-request-id")
+    });
   });
 
   it("fails closed for unknown hosts", async () => {

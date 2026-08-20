@@ -43,6 +43,13 @@ import {
 } from "./usage";
 import { logUsagePoll, type UsagePollSource } from "./usage-log";
 import { normalizeClose, webSocketMessageBytes } from "./websocket";
+import {
+  logPathname,
+  logRuntime,
+  REQUEST_ID_HEADER,
+  requestIdFromRequest,
+  responseErrorType
+} from "./observability";
 
 const DEFAULT_GROUP_ID = "group_default";
 const DEFAULT_ENDPOINT = "default";
@@ -224,48 +231,85 @@ export class PoolCoordinator {
   async fetch(request: Request): Promise<Response> {
     const surface = request.headers.get("x-poolgate-surface");
     const url = new URL(request.url);
+    const requestId = requestIdFromRequest(request);
+    const startedAt = Date.now();
+    const requestFields = {
+      requestId, surface: surface || "missing", method: request.method, path: logPathname(url.pathname)
+    };
+    logRuntime("log", "coordinator", "request", "started", requestFields);
     try {
-      if (surface === "admin") return await this.handleAdmin(request, url);
-      if (surface === "proxy") return await this.handleProxy(request, url);
-      await discardRequestBody(request);
-      return jsonError(400, "invalid_surface", "request was not routed through the Poolgate Edge worker");
+      let response: Response;
+      if (surface === "admin") response = await this.handleAdmin(request, url);
+      else if (surface === "proxy") response = await this.handleProxy(request, url);
+      else {
+        await discardRequestBody(request);
+        response = jsonError(400, "invalid_surface", "request was not routed through the Poolgate Edge worker");
+      }
+      const level = response.status >= 500 ? "error" : response.status >= 400 ? "warn" : "log";
+      logRuntime(level, "coordinator", "request", response.status >= 400 ? "failed" : "completed", {
+        ...requestFields,
+        statusCode: response.status,
+        errorType: responseErrorType(response),
+        durationMs: Date.now() - startedAt
+      });
+      return response;
     } catch (error) {
       await discardRequestBody(request);
-      console.error("request failed", error);
+      logRuntime("error", "coordinator", "request", "failed", {
+        ...requestFields,
+        statusCode: 500,
+        errorType: "unhandled_exception",
+        error: errorReason(error),
+        durationMs: Date.now() - startedAt
+      });
       return jsonError(500, "internal_error", "the request could not be completed");
     }
   }
 
   async alarm(): Promise<void> {
-    this.state.storage.transactionSync(() => {
-      this.sql.exec("DELETE FROM turn_affinity WHERE expires_at <= ?", new Date().toISOString());
-    });
-    const now = new Date().toISOString();
-    const due = this.sql
-      .exec<{ id: string }>(
-        `SELECT id FROM accounts
-          WHERE enabled = 1 AND state NOT IN ('revoked', 'dead')
-            AND (next_probe_at = '' OR next_probe_at <= ?)
-            AND (cooldown_until = '' OR cooldown_until <= ?)
-          ORDER BY CASE WHEN next_probe_at = '' THEN 0 ELSE 1 END, next_probe_at ASC, id ASC
-          LIMIT ?`,
-        now,
-        now,
-        MAX_PROBES_PER_ALARM
-      )
-      .toArray();
-    for (const account of due) {
-      try {
-        await this.pollAccountUsage(account.id, "scheduled");
-      } catch (error) {
-        const accountRef = (await sha256Hex(account.id)).slice(0, 12);
-        logUsagePoll("error", "scheduled", "unhandled_exception", "failed", {
-          accountRef, error: errorReason(error)
-        });
-        this.deferProbe(account.id);
+    const alarmId = randomId("alarm");
+    const startedAt = Date.now();
+    logRuntime("log", "scheduler", "alarm", "started", { alarmId });
+    try {
+      this.state.storage.transactionSync(() => {
+        this.sql.exec("DELETE FROM turn_affinity WHERE expires_at <= ?", new Date().toISOString());
+      });
+      const now = new Date().toISOString();
+      const due = this.sql
+        .exec<{ id: string }>(
+          `SELECT id FROM accounts
+            WHERE enabled = 1 AND state NOT IN ('revoked', 'dead')
+              AND (next_probe_at = '' OR next_probe_at <= ?)
+              AND (cooldown_until = '' OR cooldown_until <= ?)
+            ORDER BY CASE WHEN next_probe_at = '' THEN 0 ELSE 1 END, next_probe_at ASC, id ASC
+            LIMIT ?`,
+          now,
+          now,
+          MAX_PROBES_PER_ALARM
+        )
+        .toArray();
+      logRuntime("log", "scheduler", "usage_batch", "progress", { alarmId, dueCount: due.length });
+      for (const account of due) {
+        try {
+          await this.pollAccountUsage(account.id, "scheduled", alarmId);
+        } catch (error) {
+          const accountRef = (await sha256Hex(account.id)).slice(0, 12);
+          logUsagePoll("error", "scheduled", "unhandled_exception", "failed", {
+            accountRef, alarmId, error: errorReason(error)
+          });
+          this.deferProbe(account.id);
+        }
       }
+      await this.scheduleNextAlarm();
+      logRuntime("log", "scheduler", "alarm", "completed", {
+        alarmId, dueCount: due.length, durationMs: Date.now() - startedAt
+      });
+    } catch (error) {
+      logRuntime("error", "scheduler", "alarm", "failed", {
+        alarmId, error: errorReason(error), durationMs: Date.now() - startedAt
+      });
+      throw error;
     }
-    await this.scheduleNextAlarm();
   }
 
   private async handleAdmin(request: Request, url: URL): Promise<Response> {
@@ -313,7 +357,7 @@ export class PoolCoordinator {
     }
     const deviceLoginMatch = /^\/admin\/api\/accounts\/login\/device\/([A-Za-z0-9_]+)\/poll$/.exec(url.pathname);
     if (request.method === "POST" && deviceLoginMatch) {
-      return this.pollDeviceLogin(deviceLoginMatch[1]);
+      return this.pollDeviceLogin(deviceLoginMatch[1], requestIdFromRequest(request));
     }
 
     const accountMatch = /^\/admin\/api\/accounts\/([A-Za-z0-9_]+)$/.exec(url.pathname);
@@ -322,7 +366,7 @@ export class PoolCoordinator {
     }
     const accountProbeMatch = /^\/admin\/api\/accounts\/([A-Za-z0-9_]+)\/probe$/.exec(url.pathname);
     if (request.method === "POST" && accountProbeMatch) {
-      const result = await this.pollAccountUsage(accountProbeMatch[1], "manual");
+      const result = await this.pollAccountUsage(accountProbeMatch[1], "manual", requestIdFromRequest(request));
       return result instanceof Response ? result : json({ usage: result });
     }
     if (request.method === "GET" && url.pathname === "/admin/api/policy-groups") {
@@ -373,7 +417,9 @@ export class PoolCoordinator {
 
   private async importAccount(request: Request): Promise<Response> {
     const operationRef = randomId("trace");
-    logAccountAdd("log", "auth_json_import", "request_received", "started", { operationRef });
+    logAccountAdd("log", "auth_json_import", "request_received", "started", {
+      operationRef, requestId: requestIdFromRequest(request)
+    });
     const bytes = await request.arrayBuffer();
     if (bytes.byteLength > MAX_ADMIN_BODY_BYTES) {
       logAccountAdd("warn", "auth_json_import", "request_validation", "failed", {
@@ -439,7 +485,9 @@ export class PoolCoordinator {
   private async startDeviceLogin(request: Request): Promise<Response> {
     const id = randomId("login");
     const loginRef = (await sha256Hex(id)).slice(0, 12);
-    logAccountAdd("log", "device_login", "request_received", "started", { loginRef });
+    logAccountAdd("log", "device_login", "request_received", "started", {
+      loginRef, requestId: requestIdFromRequest(request)
+    });
     try {
       assertPinnedOAuthIssuer(this.env.OAUTH_ISSUER);
     } catch (error) {
@@ -553,8 +601,9 @@ export class PoolCoordinator {
     }, 201);
   }
 
-  private async pollDeviceLogin(id: string): Promise<Response> {
+  private async pollDeviceLogin(id: string, requestId = "missing"): Promise<Response> {
     const loginRef = (await sha256Hex(id)).slice(0, 12);
+    logAccountAdd("log", "device_login", "poll_requested", "started", { loginRef, requestId });
     const row = this.sql.exec<DeviceLoginRow>("SELECT * FROM oauth_device_logins WHERE id = ?", id).toArray()[0];
     if (!row) {
       logAccountAdd("warn", "device_login", "load_login_state", "failed", {
@@ -1365,24 +1414,61 @@ export class PoolCoordinator {
   }
 
   private async authorizeApiKey(request: Request, endpoint: string): Promise<SelectedApiKey | Response | null> {
+    const requestId = requestIdFromRequest(request);
     const secret = bearerToken(request);
-    if (!secret) return null;
+    if (!secret) {
+      logRuntime("warn", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, reason: "missing_bearer_token"
+      });
+      return null;
+    }
     const hash = await sha256Hex(secret);
+    const apiKeyRef = hash.slice(0, 12);
     const row = this.sql
       .exec<{ id: string; label: string; endpoints: string; ip_allowlist: string; expires_at: string }>(
         "SELECT id, label, endpoints, ip_allowlist, expires_at FROM api_keys WHERE key_hash = ?",
         hash
       )
       .toArray()[0];
-    if (!row || (row.expires_at && Date.parse(row.expires_at) <= Date.now())) return null;
+    if (!row) {
+      logRuntime("warn", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, apiKeyRef, reason: "unknown_key"
+      });
+      return null;
+    }
+    if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) {
+      logRuntime("warn", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, apiKeyRef, reason: "expired_key"
+      });
+      return null;
+    }
     const endpoints = this.parseEndpointScopeStrict(row.endpoints);
-    if (endpoints === null) return null;
-    if (endpoints.length > 0 && !endpoints.includes(endpoint)) return null;
+    if (endpoints === null) {
+      logRuntime("error", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, apiKeyRef, reason: "invalid_stored_endpoint_scope"
+      });
+      return null;
+    }
+    if (endpoints.length > 0 && !endpoints.includes(endpoint)) {
+      logRuntime("warn", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, apiKeyRef, reason: "endpoint_scope_denied"
+      });
+      return null;
+    }
     const ipAllowlist = this.parseIpAllowlistStrict(row.ip_allowlist);
-    if (ipAllowlist === null) return null;
+    if (ipAllowlist === null) {
+      logRuntime("error", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, apiKeyRef, reason: "invalid_stored_ip_allowlist"
+      });
+      return null;
+    }
     if (ipAllowlist.length > 0 && !matchesIpAllowlist(request.headers.get("x-poolgate-client-ip") ?? "", ipAllowlist)) {
+      logRuntime("warn", "proxy_auth", "api_key", "failed", {
+        requestId, endpoint, apiKeyRef, reason: "client_ip_denied", hasClientIp: Boolean(request.headers.get("x-poolgate-client-ip"))
+      });
       return jsonError(403, "api_key_ip_denied", "this API key is not allowed from the current client IP");
     }
+    logRuntime("log", "proxy_auth", "api_key", "completed", { requestId, endpoint, apiKeyRef });
     return { id: row.id, label: row.label, endpoints, ipAllowlist };
   }
 
@@ -1418,16 +1504,36 @@ export class PoolCoordinator {
   }
 
   private async proxyHttp(request: Request, resolution: EndpointResolution): Promise<Response> {
+    const requestId = requestIdFromRequest(request);
+    const startedAt = Date.now();
+    logRuntime("log", "proxy_http", "request", "started", {
+      requestId, endpoint: resolution.endpoint, candidateCount: resolution.accounts.length
+    });
     const availability = this.availabilityResponse(resolution);
     if (availability) {
       await discardRequestBody(request);
+      logRuntime("warn", "proxy_http", "account_selection", "failed", {
+        requestId,
+        endpoint: resolution.endpoint,
+        reason: responseErrorType(availability) || "backpressure",
+        statusCode: availability.status
+      });
       return availability;
     }
     const bodyResult = await this.streamingRequestBody(request);
-    if (bodyResult instanceof Response) return bodyResult;
+    if (bodyResult instanceof Response) {
+      logRuntime("warn", "proxy_http", "request_validation", "failed", {
+        requestId,
+        endpoint: resolution.endpoint,
+        reason: responseErrorType(bodyResult),
+        statusCode: bodyResult.status
+      });
+      return bodyResult;
+    }
     const excluded = new Set<string>();
     let lastStatus = 503;
     let lastMessage = "no eligible account is available";
+    let attempt = 0;
 
     while (excluded.size < resolution.accounts.length) {
       const account = await this.selectForRequest(request, resolution, excluded);
@@ -1438,10 +1544,23 @@ export class PoolCoordinator {
         }
         break;
       }
+      attempt += 1;
+      const accountRef = (await sha256Hex(account.id)).slice(0, 12);
+      logRuntime("log", "proxy_http", "account_selection", "progress", {
+        requestId, endpoint: resolution.endpoint, accountRef, attempt
+      });
       this.acquire(account.id);
       let committed = false;
       try {
-        let credentials = await this.decryptAccount(account);
+        let credentials: DecryptedAccount;
+        try {
+          credentials = await this.decryptAccount(account);
+        } catch (error) {
+          logRuntime("error", "proxy_http", "decrypt_credentials", "failed", {
+            requestId, endpoint: resolution.endpoint, accountRef, attempt, error: errorReason(error)
+          });
+          throw error;
+        }
         let refreshed = false;
 
         for (;;) {
@@ -1454,56 +1573,95 @@ export class PoolCoordinator {
               redirect: SAFE_FETCH_REDIRECT,
               signal: request.signal
             });
-          } catch {
+          } catch (error) {
             if (request.signal.aborted) {
+              logRuntime("warn", "proxy_http", "upstream_fetch", "failed", {
+                requestId, endpoint: resolution.endpoint, accountRef, attempt, reason: "client_cancelled"
+              });
               return jsonError(408, "request_cancelled", "request was cancelled before the upstream response committed");
             }
             lastMessage = "upstream connection failed";
+            logRuntime("error", "proxy_http", "upstream_fetch", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "connection_failed", error: errorReason(error)
+            });
             this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
             break;
           }
 
           if (upstream.status === 401) {
+            const upstreamFields = await upstreamErrorFields(upstream);
             upstream.body?.cancel().catch(() => undefined);
             if (!refreshed) {
-            try {
-              credentials = await this.refreshAccount(account.id, credentials.credentialVersion);
-              refreshed = true;
-              continue;
-            } catch (error) {
-              lastStatus = 502;
-              if (error instanceof OAuthRefreshFailure && error.terminal) {
-                this.markState(account.id, "expired", "");
-                lastMessage = "account authorization expired";
-              } else {
-                this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
-                lastMessage = "account credential refresh is temporarily unavailable";
+              logRuntime("warn", "proxy_http", "upstream_authorization", "progress", {
+                requestId, endpoint: resolution.endpoint, accountRef, attempt,
+                reason: "unauthorized_refreshing", ...upstreamFields
+              });
+              try {
+                credentials = await this.refreshAccount(account.id, credentials.credentialVersion);
+                refreshed = true;
+                logRuntime("log", "proxy_http", "credential_refresh", "completed", {
+                  requestId, endpoint: resolution.endpoint, accountRef, attempt
+                });
+                continue;
+              } catch (error) {
+                lastStatus = 502;
+                const terminal = error instanceof OAuthRefreshFailure && error.terminal;
+                logRuntime("error", "proxy_http", "credential_refresh", "failed", {
+                  requestId, endpoint: resolution.endpoint, accountRef, attempt,
+                  terminal, error: errorReason(error)
+                });
+                if (terminal) {
+                  this.markState(account.id, "expired", "");
+                  lastMessage = "account authorization expired";
+                } else {
+                  this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
+                  lastMessage = "account credential refresh is temporarily unavailable";
+                }
+                break;
               }
-              break;
             }
-          }
-          if (!refreshed) break;
-          this.markState(account.id, "expired", "");
+            if (!refreshed) break;
+            logRuntime("error", "proxy_http", "upstream_authorization", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "unauthorized_after_refresh", ...upstreamFields
+            });
+            this.markState(account.id, "expired", "");
             lastStatus = 502;
             lastMessage = "account authorization expired";
             break;
           }
           if (isRedirectStatus(upstream.status)) {
+            const upstreamFields = await upstreamErrorFields(upstream);
             lastStatus = 502;
             lastMessage = "upstream redirect rejected";
+            logRuntime("error", "proxy_http", "upstream_response", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "redirect_rejected", ...upstreamFields
+            });
             this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
             upstream.body?.cancel().catch(() => undefined);
             break;
           }
           if (RETRYABLE_STATUS.has(upstream.status)) {
+            const retryAfterMs = retryAfter(upstream);
+            const upstreamFields = await upstreamErrorFields(upstream);
             lastStatus = upstream.status;
             lastMessage = "upstream temporarily unavailable";
-            this.markState(account.id, "cooldown", new Date(Date.now() + retryAfter(upstream)).toISOString());
+            logRuntime("warn", "proxy_http", "upstream_response", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "retryable_status", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstreamFields
+            });
+            this.markState(account.id, "cooldown", new Date(Date.now() + retryAfterMs).toISOString());
             upstream.body?.cancel().catch(() => undefined);
             break;
           }
           this.markStateSafe(account.id, "ok", "");
           await this.rememberTurnAffinitySafe(upstream.headers.get("x-codex-turn-state"), account.id);
+          logRuntime(upstream.status >= 400 ? "warn" : "log", "proxy_http", "upstream_response", "completed", {
+            requestId, endpoint: resolution.endpoint, accountRef, attempt, refreshed,
+            upstreamStatus: upstream.status, durationMs: Date.now() - startedAt
+          });
           const response = this.streamResponse(upstream, account.id);
           committed = true;
           return response;
@@ -1513,15 +1671,31 @@ export class PoolCoordinator {
       }
       excluded.add(account.id);
     }
+    logRuntime("error", "proxy_http", "retry_exhausted", "failed", {
+      requestId, endpoint: resolution.endpoint, attempts: attempt,
+      statusCode: lastStatus, reason: lastMessage, durationMs: Date.now() - startedAt
+    });
     return jsonError(lastStatus, "upstream_unavailable", lastMessage);
   }
 
   private async proxyWebSocket(request: Request, resolution: EndpointResolution): Promise<Response> {
+    const requestId = requestIdFromRequest(request);
+    const startedAt = Date.now();
+    logRuntime("log", "proxy_websocket", "handshake", "started", {
+      requestId, endpoint: resolution.endpoint, candidateCount: resolution.accounts.length
+    });
     const availability = this.availabilityResponse(resolution);
-    if (availability) return availability;
+    if (availability) {
+      logRuntime("warn", "proxy_websocket", "account_selection", "failed", {
+        requestId, endpoint: resolution.endpoint,
+        reason: responseErrorType(availability) || "backpressure", statusCode: availability.status
+      });
+      return availability;
+    }
     const excluded = new Set<string>();
     let lastStatus = 502;
     let lastMessage = "all eligible accounts rejected the WebSocket handshake";
+    let attempt = 0;
     while (excluded.size < resolution.accounts.length) {
       const account = await this.selectForRequest(request, resolution, excluded);
       if (!account) {
@@ -1531,10 +1705,23 @@ export class PoolCoordinator {
         }
         break;
       }
+      attempt += 1;
+      const accountRef = (await sha256Hex(account.id)).slice(0, 12);
+      logRuntime("log", "proxy_websocket", "account_selection", "progress", {
+        requestId, endpoint: resolution.endpoint, accountRef, attempt
+      });
       this.acquire(account.id);
       let committed = false;
       try {
-        let credentials = await this.decryptAccount(account);
+        let credentials: DecryptedAccount;
+        try {
+          credentials = await this.decryptAccount(account);
+        } catch (error) {
+          logRuntime("error", "proxy_websocket", "decrypt_credentials", "failed", {
+            requestId, endpoint: resolution.endpoint, accountRef, attempt, error: errorReason(error)
+          });
+          throw error;
+        }
         let refreshed = false;
 
         for (;;) {
@@ -1547,56 +1734,95 @@ export class PoolCoordinator {
               redirect: SAFE_FETCH_REDIRECT,
               signal: request.signal
             });
-          } catch {
+          } catch (error) {
             if (request.signal.aborted) {
+              logRuntime("warn", "proxy_websocket", "upstream_fetch", "failed", {
+                requestId, endpoint: resolution.endpoint, accountRef, attempt, reason: "client_cancelled"
+              });
               return jsonError(408, "request_cancelled", "request was cancelled before the WebSocket handshake committed");
             }
             lastMessage = "upstream WebSocket connection failed";
+            logRuntime("error", "proxy_websocket", "upstream_fetch", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "connection_failed", error: errorReason(error)
+            });
             this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
             break;
           }
           if (upstreamResponse.status === 401) {
+            const upstreamFields = await upstreamErrorFields(upstreamResponse);
             upstreamResponse.body?.cancel().catch(() => undefined);
             if (!refreshed) {
-            try {
-              credentials = await this.refreshAccount(account.id, credentials.credentialVersion);
-              refreshed = true;
-              continue;
-            } catch (error) {
-              if (error instanceof OAuthRefreshFailure && error.terminal) {
-                this.markState(account.id, "expired", "");
-                lastMessage = "account authorization expired";
-              } else {
-                this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
-                lastMessage = "account credential refresh is temporarily unavailable";
+              logRuntime("warn", "proxy_websocket", "upstream_authorization", "progress", {
+                requestId, endpoint: resolution.endpoint, accountRef, attempt,
+                reason: "unauthorized_refreshing", ...upstreamFields
+              });
+              try {
+                credentials = await this.refreshAccount(account.id, credentials.credentialVersion);
+                refreshed = true;
+                logRuntime("log", "proxy_websocket", "credential_refresh", "completed", {
+                  requestId, endpoint: resolution.endpoint, accountRef, attempt
+                });
+                continue;
+              } catch (error) {
+                const terminal = error instanceof OAuthRefreshFailure && error.terminal;
+                logRuntime("error", "proxy_websocket", "credential_refresh", "failed", {
+                  requestId, endpoint: resolution.endpoint, accountRef, attempt,
+                  terminal, error: errorReason(error)
+                });
+                if (terminal) {
+                  this.markState(account.id, "expired", "");
+                  lastMessage = "account authorization expired";
+                } else {
+                  this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
+                  lastMessage = "account credential refresh is temporarily unavailable";
+                }
+                break;
               }
-              break;
             }
-          }
-          if (!refreshed) break;
-          this.markState(account.id, "expired", "");
+            if (!refreshed) break;
+            logRuntime("error", "proxy_websocket", "upstream_authorization", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "unauthorized_after_refresh", ...upstreamFields
+            });
+            this.markState(account.id, "expired", "");
             lastMessage = "account authorization expired";
             break;
           }
           if (isRedirectStatus(upstreamResponse.status)) {
+            const upstreamFields = await upstreamErrorFields(upstreamResponse);
             lastStatus = 502;
             lastMessage = "upstream WebSocket redirect rejected";
+            logRuntime("error", "proxy_websocket", "upstream_response", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "redirect_rejected", ...upstreamFields
+            });
             this.markState(account.id, "cooldown", new Date(Date.now() + 30_000).toISOString());
             upstreamResponse.body?.cancel().catch(() => undefined);
             break;
           }
           if (upstreamResponse.status !== 101 || !upstreamResponse.webSocket) {
+            const upstreamFields = await upstreamErrorFields(upstreamResponse);
             if (RETRYABLE_STATUS.has(upstreamResponse.status)) {
+              const retryAfterMs = retryAfter(upstreamResponse);
               lastStatus = upstreamResponse.status;
               lastMessage = "upstream temporarily unavailable";
-              this.markState(account.id, "cooldown", new Date(Date.now() + retryAfter(upstreamResponse)).toISOString());
+              logRuntime("warn", "proxy_websocket", "upstream_response", "failed", {
+                requestId, endpoint: resolution.endpoint, accountRef, attempt,
+                reason: "retryable_status", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstreamFields
+              });
+              this.markState(account.id, "cooldown", new Date(Date.now() + retryAfterMs).toISOString());
               upstreamResponse.body?.cancel().catch(() => undefined);
               break;
             }
-            upstreamResponse.body?.cancel().catch(() => undefined);
             const rejectionStatus = upstreamResponse.status >= 400 && upstreamResponse.status < 500
               ? upstreamResponse.status
               : 502;
+            logRuntime("error", "proxy_websocket", "upstream_response", "failed", {
+              requestId, endpoint: resolution.endpoint, accountRef, attempt,
+              reason: "handshake_rejected", ...upstreamFields
+            });
+            upstreamResponse.body?.cancel().catch(() => undefined);
             return jsonError(rejectionStatus, "upstream_rejected", "upstream rejected the WebSocket handshake");
           }
 
@@ -1612,6 +1838,10 @@ export class PoolCoordinator {
             closed = true;
             this.release(account.id);
             const close = normalizeClose(code, reason);
+            logRuntime(close.code >= 1011 ? "warn" : "log", "proxy_websocket", "connection", "completed", {
+              requestId, endpoint: resolution.endpoint, accountRef,
+              closeCode: close.code, hasReason: Boolean(close.reason), durationMs: Date.now() - startedAt
+            });
             try { server.close(close.code, close.reason); } catch { /* already closed */ }
             try { upstream.close(close.code, close.reason); } catch { /* already closed */ }
           };
@@ -1639,7 +1869,12 @@ export class PoolCoordinator {
             upstreamResponse.headers.get("x-codex-turn-state") ?? request.headers.get("x-codex-turn-state"),
             account.id
           );
+          logRuntime("log", "proxy_websocket", "handshake", "completed", {
+            requestId, endpoint: resolution.endpoint, accountRef, attempt, refreshed,
+            upstreamStatus: upstreamResponse.status, durationMs: Date.now() - startedAt
+          });
           const responseHeaders = new Headers();
+          responseHeaders.set(REQUEST_ID_HEADER, requestId);
           const protocol = upstreamResponse.headers.get("sec-websocket-protocol");
           if (protocol) responseHeaders.set("sec-websocket-protocol", protocol);
           const response = new Response(null, { status: 101, headers: responseHeaders, webSocket: client });
@@ -1651,15 +1886,20 @@ export class PoolCoordinator {
       }
       excluded.add(account.id);
     }
+    logRuntime("error", "proxy_websocket", "retry_exhausted", "failed", {
+      requestId, endpoint: resolution.endpoint, attempts: attempt,
+      statusCode: lastStatus, reason: lastMessage, durationMs: Date.now() - startedAt
+    });
     return jsonError(lastStatus, "upstream_unavailable", lastMessage);
   }
 
   private availabilityResponse(resolution: EndpointResolution): Response | null {
     const availability = accountAvailability(resolution.accounts, this.selection);
     if (availability === "saturated") {
-      return json(
-        { error: { type: "backpressure", message: "all eligible accounts are at their concurrency limit" } },
+      return jsonError(
         429,
+        "backpressure",
+        "all eligible accounts are at their concurrency limit",
         { "retry-after": "1" }
       );
     }
@@ -1787,7 +2027,7 @@ export class PoolCoordinator {
     try {
       await this.rememberTurnAffinity(turnState, accountId);
     } catch (error) {
-      console.warn("turn affinity update failed", error instanceof Error ? error.message : "unknown error");
+      logRuntime("warn", "turn_affinity", "persist", "failed", { error: errorReason(error) });
     }
   }
 
@@ -1832,27 +2072,31 @@ export class PoolCoordinator {
     return JSON.parse(new TextDecoder().decode(body)) as unknown;
   }
 
-  private async pollAccountUsage(accountId: string, source: UsagePollSource): Promise<CurrentUsage | Response> {
+  private async pollAccountUsage(
+    accountId: string,
+    source: UsagePollSource,
+    operationRef = randomId("usage")
+  ): Promise<CurrentUsage | Response> {
     const startedAt = Date.now();
     const accountRef = (await sha256Hex(accountId)).slice(0, 12);
-    logUsagePoll("log", source, "request_received", "started", { accountRef });
+    const usageLog = (
+      level: "log" | "warn" | "error",
+      stage: string,
+      status: "started" | "progress" | "failed" | "completed",
+      fields: Record<string, string | number | boolean | null | undefined> = {}
+    ) => logUsagePoll(level, source, stage, status, { accountRef, operationRef, ...fields });
+    usageLog("log", "request_received", "started");
     const row = this.sql.exec<AccountRow>("SELECT * FROM accounts WHERE id = ?", accountId).toArray()[0];
     if (!row) {
-      logUsagePoll("warn", source, "account_validation", "failed", {
-        accountRef, reason: "not_found"
-      });
+      usageLog("warn", "account_validation", "failed", { reason: "not_found" });
       return jsonError(404, "not_found", "account not found");
     }
     if (!row.enabled) {
-      logUsagePoll("warn", source, "account_validation", "failed", {
-        accountRef, reason: "disabled"
-      });
+      usageLog("warn", "account_validation", "failed", { reason: "disabled" });
       return jsonError(409, "account_disabled", "disabled account cannot be probed");
     }
     if (row.state === "revoked" || row.state === "dead") {
-      logUsagePoll("warn", source, "account_validation", "failed", {
-        accountRef, reason: "terminal_state", accountState: row.state
-      });
+      usageLog("warn", "account_validation", "failed", { reason: "terminal_state", accountState: row.state });
       return jsonError(409, "account_not_probeable", "terminal account cannot be probed");
     }
 
@@ -1860,15 +2104,13 @@ export class PoolCoordinator {
     try {
       credentials = await this.decryptAccount(rowToAccount(row));
     } catch (error) {
-      logUsagePoll("error", source, "decrypt_credentials", "failed", {
-        accountRef, error: errorReason(error)
-      });
+      usageLog("error", "decrypt_credentials", "failed", { error: errorReason(error) });
       throw error;
     }
     let refreshed = false;
     for (;;) {
       let response: Response;
-      logUsagePoll("log", source, "fetch_usage", "progress", { accountRef, refreshed });
+      usageLog("log", "fetch_usage", "progress", { refreshed });
       try {
         response = await fetch(this.usageUrl(), {
           method: "GET",
@@ -1877,8 +2119,7 @@ export class PoolCoordinator {
           signal: AbortSignal.timeout(USAGE_REQUEST_TIMEOUT_MS)
         });
       } catch (error) {
-        logUsagePoll("error", source, "fetch_usage", "failed", {
-          accountRef,
+        usageLog("error", "fetch_usage", "failed", {
           refreshed,
           reason: error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "upstream_fetch_error",
           error: errorReason(error),
@@ -1892,25 +2133,19 @@ export class PoolCoordinator {
         const upstream = await upstreamErrorFields(response);
         response.body?.cancel().catch(() => undefined);
         if (refreshed) {
-          logUsagePoll("error", source, "authorize_usage", "failed", {
-            accountRef, reason: "unauthorized_after_refresh", ...upstream
-          });
+          usageLog("error", "authorize_usage", "failed", { reason: "unauthorized_after_refresh", ...upstream });
           this.markState(accountId, "expired", "");
           return jsonError(502, "account_authorization_expired", "account authorization expired after refresh");
         }
-        logUsagePoll("warn", source, "authorize_usage", "progress", {
-          accountRef, reason: "unauthorized_refreshing", ...upstream
-        });
+        usageLog("warn", "authorize_usage", "progress", { reason: "unauthorized_refreshing", ...upstream });
         try {
           credentials = await this.refreshAccount(accountId, credentials.credentialVersion);
           refreshed = true;
-          logUsagePoll("log", source, "refresh_credentials", "completed", { accountRef });
+          usageLog("log", "refresh_credentials", "completed");
           continue;
         } catch (error) {
           const terminal = error instanceof OAuthRefreshFailure && error.terminal;
-          logUsagePoll("error", source, "refresh_credentials", "failed", {
-            accountRef, terminal, error: errorReason(error)
-          });
+          usageLog("error", "refresh_credentials", "failed", { terminal, error: errorReason(error) });
           if (error instanceof OAuthRefreshFailure && error.terminal) {
             this.markState(accountId, "expired", "");
             return jsonError(502, "account_authorization_expired", "account authorization expired");
@@ -1924,8 +2159,8 @@ export class PoolCoordinator {
         const retryAfterMs = retryAfter(response, MAX_USAGE_RETRY_AFTER_MS);
         const upstream = await upstreamErrorFields(response);
         const until = new Date(Date.now() + retryAfterMs).toISOString();
-        logUsagePoll("warn", source, "fetch_usage", "failed", {
-          accountRef, reason: "rate_limited", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstream
+        usageLog("warn", "fetch_usage", "failed", {
+          reason: "rate_limited", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstream
         });
         response.body?.cancel().catch(() => undefined);
         this.markState(accountId, "cooldown", until);
@@ -1933,8 +2168,8 @@ export class PoolCoordinator {
       }
       if (!response.ok) {
         const upstream = await upstreamErrorFields(response);
-        logUsagePoll("error", source, "fetch_usage", "failed", {
-          accountRef, reason: "upstream_rejected", ...upstream, durationMs: Date.now() - startedAt
+        usageLog("error", "fetch_usage", "failed", {
+          reason: "upstream_rejected", ...upstream, durationMs: Date.now() - startedAt
         });
         response.body?.cancel().catch(() => undefined);
         this.deferProbe(accountId);
@@ -1945,8 +2180,8 @@ export class PoolCoordinator {
       try {
         parsed = parseUsagePayload(await this.readUsageJson(response));
       } catch (error) {
-        logUsagePoll("error", source, "parse_usage_response", "failed", {
-          accountRef, error: errorReason(error), durationMs: Date.now() - startedAt
+        usageLog("error", "parse_usage_response", "failed", {
+          error: errorReason(error), durationMs: Date.now() - startedAt
         });
         this.deferProbe(accountId);
         return jsonError(502, "invalid_usage_response", "account usage response is invalid");
@@ -1962,15 +2197,11 @@ export class PoolCoordinator {
         )
         .toArray()[0];
       if (!current) {
-        logUsagePoll("warn", source, "persist_usage", "failed", {
-          accountRef, reason: "account_deleted_during_poll"
-        });
+        usageLog("warn", "persist_usage", "failed", { reason: "account_deleted_during_poll" });
         return jsonError(404, "not_found", "account not found");
       }
       if (!current.enabled) {
-        logUsagePoll("warn", source, "persist_usage", "failed", {
-          accountRef, reason: "account_disabled_during_poll"
-        });
+        usageLog("warn", "persist_usage", "failed", { reason: "account_disabled_during_poll" });
         return jsonError(409, "account_disabled", "account was disabled during the usage check");
       }
       const currentGate = Date.parse(current.cooldown_until);
@@ -2013,13 +2244,10 @@ export class PoolCoordinator {
         });
         await this.scheduleNextAlarm();
       } catch (error) {
-        logUsagePoll("error", source, "persist_usage", "failed", {
-          accountRef, error: errorReason(error)
-        });
+        usageLog("error", "persist_usage", "failed", { error: errorReason(error) });
         throw error;
       }
-      logUsagePoll("log", source, "complete", "completed", {
-        accountRef,
+      usageLog("log", "complete", "completed", {
         durationMs: Date.now() - startedAt,
         planType: parsed.planType,
         windowCount: parsed.windows.length,
@@ -2134,7 +2362,12 @@ export class PoolCoordinator {
     try {
       this.markState(accountId, state, cooldownUntil);
     } catch (error) {
-      console.warn("account state update failed", error instanceof Error ? error.message : "unknown error");
+      const reason = errorReason(error);
+      this.state.waitUntil(sha256Hex(accountId).then((hash) => {
+        logRuntime("warn", "account_state", "persist", "failed", {
+          accountRef: hash.slice(0, 12), targetState: state, error: reason
+        });
+      }));
     }
   }
 
@@ -2165,30 +2398,71 @@ export class PoolCoordinator {
   }
 
   private async performRefresh(accountId: string, observedVersion: number): Promise<DecryptedAccount> {
-    await this.reconcileRotation(accountId);
-    const before = await this.decryptAccount(this.getAccount(accountId));
-    if (before.credentialVersion !== observedVersion) return before;
-    const issuer = new URL(this.env.OAUTH_ISSUER);
-    if (
-      issuer.protocol !== "https:" ||
-      issuer.hostname !== "auth.openai.com" ||
-      issuer.pathname !== "/oauth/token" ||
-      issuer.username ||
-      issuer.password ||
-      issuer.search ||
-      issuer.hash
-    ) throw new Error("OAUTH_ISSUER must be https://auth.openai.com/oauth/token");
-    const response = await fetch(issuer, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: before.refreshToken,
-        client_id: this.env.OAUTH_CLIENT_ID
-      }),
-      redirect: SAFE_FETCH_REDIRECT
-    });
+    const accountRef = (await sha256Hex(accountId)).slice(0, 12);
+    const startedAt = Date.now();
+    logRuntime("log", "credential_rotation", "refresh", "started", { accountRef, observedVersion });
+    try {
+      await this.reconcileRotation(accountId);
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "reconcile", "failed", {
+        accountRef, error: errorReason(error)
+      });
+      throw error;
+    }
+    let before: DecryptedAccount;
+    try {
+      before = await this.decryptAccount(this.getAccount(accountId));
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "decrypt_credentials", "failed", {
+        accountRef, error: errorReason(error)
+      });
+      throw error;
+    }
+    if (before.credentialVersion !== observedVersion) {
+      logRuntime("log", "credential_rotation", "refresh", "completed", {
+        accountRef, reason: "already_refreshed", credentialVersion: before.credentialVersion,
+        durationMs: Date.now() - startedAt
+      });
+      return before;
+    }
+    let issuer: URL;
+    try {
+      issuer = new URL(this.env.OAUTH_ISSUER);
+      if (
+        issuer.protocol !== "https:" ||
+        issuer.hostname !== "auth.openai.com" ||
+        issuer.pathname !== "/oauth/token" ||
+        issuer.username ||
+        issuer.password ||
+        issuer.search ||
+        issuer.hash
+      ) throw new Error("OAUTH_ISSUER must be https://auth.openai.com/oauth/token");
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "configuration", "failed", {
+        accountRef, error: errorReason(error)
+      });
+      throw error;
+    }
+    let response: Response;
+    try {
+      response = await fetch(issuer, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: before.refreshToken,
+          client_id: this.env.OAUTH_CLIENT_ID
+        }),
+        redirect: SAFE_FETCH_REDIRECT
+      });
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "oauth_request", "failed", {
+        accountRef, reason: "upstream_fetch_error", error: errorReason(error)
+      });
+      throw error;
+    }
     if (!response.ok) {
+      const upstreamFields = await upstreamErrorFields(response);
       let code = "";
       try {
         const failure = (await response.json()) as OAuthResponse;
@@ -2197,18 +2471,44 @@ export class PoolCoordinator {
         // A malformed failure response is transient unless the issuer explicitly
         // identifies the refresh token as invalid_grant.
       }
+      logRuntime("error", "credential_rotation", "oauth_response", "failed", {
+        accountRef, terminal: isTerminalOAuthFailure(code), ...upstreamFields
+      });
       throw new OAuthRefreshFailure(response.status, code);
     }
-    const payload = (await response.json()) as OAuthResponse;
+    let payload: OAuthResponse;
+    try {
+      payload = (await response.json()) as OAuthResponse;
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "parse_oauth_response", "failed", {
+        accountRef, error: errorReason(error)
+      });
+      throw error;
+    }
     const accessToken = text(payload.access_token);
     const refreshToken = text(payload.refresh_token) || before.refreshToken;
     const idToken = text(payload.id_token) || before.idToken;
-    if (!accessToken) throw new Error("OAuth response has no access token");
+    if (!accessToken) {
+      logRuntime("error", "credential_rotation", "parse_oauth_response", "failed", {
+        accountRef, reason: "missing_access_token"
+      });
+      throw new Error("OAuth response has no access token");
+    }
 
-    const key = await this.masterKey;
-    const [accessTokenCiphertext, refreshTokenCiphertext, idTokenCiphertext] = await Promise.all([
-      encryptSecret(key, accessToken), encryptSecret(key, refreshToken), encryptSecret(key, idToken)
-    ]);
+    let accessTokenCiphertext: string;
+    let refreshTokenCiphertext: string;
+    let idTokenCiphertext: string;
+    try {
+      const key = await this.masterKey;
+      [accessTokenCiphertext, refreshTokenCiphertext, idTokenCiphertext] = await Promise.all([
+        encryptSecret(key, accessToken), encryptSecret(key, refreshToken), encryptSecret(key, idToken)
+      ]);
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "encrypt_credentials", "failed", {
+        accountRef, error: errorReason(error)
+      });
+      throw error;
+    }
     const journal: RotationJournalEntry = {
       accountId,
       baseVersion: before.credentialVersion,
@@ -2219,37 +2519,53 @@ export class PoolCoordinator {
       createdAt: new Date().toISOString()
     };
     const journalKey = this.rotationKey(accountId);
-    const committed = await persistCredentialRotation(journal, {
-      writeJournal: async (entry) => {
-        await this.env.ROTATION_JOURNAL.put(journalKey, JSON.stringify(entry), {
-          httpMetadata: { contentType: "application/json" }
-        });
-      },
-      compareAndSwap: (entry) => {
-        let updated = false;
-        this.state.storage.transactionSync(() => {
-          updated = this.sql
-            .exec<{ id: string }>(
-              `UPDATE accounts
-                  SET access_token = ?, refresh_token = ?, id_token = ?, credential_version = ?,
-                      state = 'ok', cooldown_until = '', last_refreshed_at = ?, updated_at = ?
-                WHERE id = ? AND credential_version = ? RETURNING id`,
-              entry.accessTokenCiphertext,
-              entry.refreshTokenCiphertext,
-              entry.idTokenCiphertext,
-              entry.targetVersion,
-              entry.createdAt,
-              entry.createdAt,
-              accountId,
-              entry.baseVersion
-            )
-            .toArray().length === 1;
-        });
-        return updated;
-      },
-      removeJournal: async () => this.env.ROTATION_JOURNAL.delete(journalKey)
+    let committed;
+    try {
+      committed = await persistCredentialRotation(journal, {
+        writeJournal: async (entry) => {
+          await this.env.ROTATION_JOURNAL.put(journalKey, JSON.stringify(entry), {
+            httpMetadata: { contentType: "application/json" }
+          });
+        },
+        compareAndSwap: (entry) => {
+          let updated = false;
+          this.state.storage.transactionSync(() => {
+            updated = this.sql
+              .exec<{ id: string }>(
+                `UPDATE accounts
+                    SET access_token = ?, refresh_token = ?, id_token = ?, credential_version = ?,
+                        state = 'ok', cooldown_until = '', last_refreshed_at = ?, updated_at = ?
+                  WHERE id = ? AND credential_version = ? RETURNING id`,
+                entry.accessTokenCiphertext,
+                entry.refreshTokenCiphertext,
+                entry.idTokenCiphertext,
+                entry.targetVersion,
+                entry.createdAt,
+                entry.createdAt,
+                accountId,
+                entry.baseVersion
+              )
+              .toArray().length === 1;
+          });
+          return updated;
+        },
+        removeJournal: async () => this.env.ROTATION_JOURNAL.delete(journalKey)
+      });
+    } catch (error) {
+      logRuntime("error", "credential_rotation", "persist", "failed", {
+        accountRef, error: errorReason(error), durationMs: Date.now() - startedAt
+      });
+      throw error;
+    }
+    if (committed.cleanupPending) {
+      logRuntime("warn", "credential_rotation", "journal_cleanup", "failed", {
+        accountRef, reason: "cleanup_pending"
+      });
+    }
+    logRuntime("log", "credential_rotation", "refresh", "completed", {
+      accountRef, updated: committed.updated, targetVersion: journal.targetVersion,
+      durationMs: Date.now() - startedAt
     });
-    if (committed.cleanupPending) console.warn("credential rotation journal cleanup is pending", accountId);
     return committed.updated
       ? { ...this.getAccount(accountId), accessToken, refreshToken, idToken }
       : this.decryptAccount(this.getAccount(accountId));
@@ -2295,8 +2611,11 @@ export class PoolCoordinator {
     }
     try {
       await this.env.ROTATION_JOURNAL.delete(key);
-    } catch {
-      console.warn("credential rotation journal cleanup is pending", accountId);
+    } catch (error) {
+      const accountRef = (await sha256Hex(accountId)).slice(0, 12);
+      logRuntime("warn", "credential_rotation", "journal_cleanup", "failed", {
+        accountRef, reason: "cleanup_pending", error: errorReason(error)
+      });
     }
   }
 
