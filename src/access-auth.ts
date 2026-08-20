@@ -1,5 +1,6 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import { jsonError } from "./http";
+import { errorReason, logRuntime } from "./observability";
 import type { Env } from "./types";
 
 interface AccessClaims {
@@ -67,25 +68,39 @@ export async function verifyAccessToken(
 
 export async function authenticateAdminAccess(
   request: Request,
-  env: Pick<Env, "ADMIN_AUTH_MODE" | "ENVIRONMENT" | "ACCESS_TEAM_DOMAIN" | "ACCESS_AUD">
+  env: Pick<Env, "ADMIN_AUTH_MODE" | "ENVIRONMENT" | "ACCESS_TEAM_DOMAIN" | "ACCESS_AUD">,
+  requestId = "missing"
 ): Promise<VerifiedAccessIdentity | Response> {
   if (env.ADMIN_AUTH_MODE === "dev" && env.ENVIRONMENT !== "production") {
     return { email: "Local development", subject: "dev" };
   }
   if (env.ADMIN_AUTH_MODE !== "access") {
+    logRuntime("error", "admin_auth", "configuration", "failed", {
+      requestId, reason: "invalid_auth_mode"
+    });
     return jsonError(503, "admin_auth_misconfigured", "admin authentication is not configured");
   }
   const issuer = accessIssuer(env.ACCESS_TEAM_DOMAIN);
   const audience = env.ACCESS_AUD.trim();
   if (!issuer || !audience) {
+    logRuntime("error", "admin_auth", "configuration", "failed", {
+      requestId, reason: "missing_or_invalid_access_configuration", hasIssuer: Boolean(issuer), hasAudience: Boolean(audience)
+    });
     return jsonError(503, "admin_auth_misconfigured", "Cloudflare Access issuer or audience is not configured");
   }
   const token = request.headers.get("cf-access-jwt-assertion")?.trim();
-  if (!token) return jsonError(401, "access_required", "Cloudflare Access authentication is required");
+  if (!token) {
+    logRuntime("warn", "admin_auth", "token_validation", "failed", {
+      requestId, reason: "missing_access_token"
+    });
+    return jsonError(401, "access_required", "Cloudflare Access authentication is required");
+  }
   try {
     return await verifyAccessToken(token, issuer, audience);
   } catch (error) {
-    console.warn("Cloudflare Access token rejected", error instanceof Error ? error.message : "verification failed");
+    logRuntime("warn", "admin_auth", "token_validation", "failed", {
+      requestId, reason: "token_rejected", error: errorReason(error)
+    });
     return jsonError(401, "invalid_access_token", "Cloudflare Access authentication is invalid or expired");
   }
 }

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  addSecurityHeaders,
   bearerToken,
   classifySurface,
   discardRequestBody,
   endpointFromPath,
   isAdminApi,
   isProxyPath,
+  jsonError,
   readBoundedRequestBody
 } from "../src/http";
 
@@ -36,6 +38,11 @@ describe("host and route isolation", () => {
 });
 
 describe("proxy request parsing", () => {
+  it("keeps internal error metadata out of public responses", () => {
+    const response = addSecurityHeaders(jsonError(502, "upstream_unavailable", "temporarily unavailable"));
+    expect(response.headers.get("x-poolgate-error-type")).toBeNull();
+  });
+
   it("extracts bearer tokens", () => {
     expect(bearerToken(new Request("https://api.example.com", { headers: { authorization: "Bearer secret" } }))).toBe("secret");
     expect(bearerToken(new Request("https://api.example.com"))).toBeNull();

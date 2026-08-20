@@ -95,7 +95,19 @@ After deployment:
 8. Send one WebSocket request and confirm both directions close cleanly.
 9. Exercise one token refresh in staging before relying on the account.
 
-## 6. Local development
+## 6. Diagnose production requests
+
+Observability, invocation logs, and traces are enabled with full sampling for this personal, low-volume Worker. Each external response includes `x-poolgate-request-id`; search that value in Cloudflare Logs to correlate the outer Worker and Durable Object stages.
+
+Application events are single-line JSON so every field remains searchable:
+
+- `poolgate_runtime`: request routing, Admin authentication, Proxy API-key validation, account selection, HTTP/WebSocket upstream attempts, OAuth credential rotation, scheduler, and storage failures.
+- `gpt_account_add`: device login and `auth.json` import stages.
+- `usage_poll`: manual and scheduled usage polling stages.
+
+Start with `status="failed"`, then inspect `component`, `stage`, `errorType`, `reason`, `upstreamStatus`, and `error`. Follow `requestId`, `operationRef`, `loginRef`, `alarmId`, or the hashed `accountRef` to see the complete operation. Logs intentionally omit request bodies, bearer tokens, cookies, credential payloads, raw login/account/key IDs, full upstream response bodies, and client IP addresses.
+
+## 7. Local development
 
 Copy `.dev.vars.example` to `.dev.vars` and set a disposable development `MASTER_KEY`. Change `ENVIRONMENT` to `development` and `ADMIN_AUTH_MODE` to `dev` only in a local Wrangler environment; never deploy that combination to production.
 

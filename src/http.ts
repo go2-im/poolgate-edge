@@ -1,4 +1,5 @@
 import type { Env, Surface } from "./types";
+import { ERROR_TYPE_HEADER } from "./observability";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
@@ -11,8 +12,10 @@ export function json(data: unknown, status = 200, headers?: HeadersInit): Respon
   return new Response(JSON.stringify(data), { status, headers: result });
 }
 
-export function jsonError(status: number, type: string, message: string): Response {
-  return json({ error: { type, message } }, status);
+export function jsonError(status: number, type: string, message: string, headers?: HeadersInit): Response {
+  const result = new Headers(headers);
+  result.set(ERROR_TYPE_HEADER, type);
+  return json({ error: { type, message } }, status, result);
 }
 
 export function classifySurface(request: Request, env: Pick<Env, "ADMIN_HOST" | "PROXY_HOST">): Surface | null {
@@ -37,6 +40,7 @@ export function isProxyPath(pathname: string): boolean {
 export function addSecurityHeaders(response: Response): Response {
   if (response.status === 101) return response;
   const headers = new Headers(response.headers);
+  headers.delete(ERROR_TYPE_HEADER);
   headers.set("x-content-type-options", "nosniff");
   headers.set("x-frame-options", "DENY");
   headers.set("referrer-policy", "no-referrer");
