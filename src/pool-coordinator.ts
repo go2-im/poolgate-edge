@@ -1,4 +1,5 @@
 import { parseAuthJson } from "./auth-import";
+import { errorReason, logAccountAdd, upstreamErrorFields } from "./account-add-log";
 import { decryptSecret, encryptSecret, importMasterKey, newApiKey, randomId, sha256Hex } from "./crypto";
 import {
   isTerminalOAuthFailure,
@@ -366,17 +367,23 @@ export class PoolCoordinator {
   }
 
   private async importAccount(request: Request): Promise<Response> {
+    const operationRef = randomId("trace");
+    logAccountAdd("log", "auth_json_import", "request_received", "started", { operationRef });
     const bytes = await request.arrayBuffer();
     if (bytes.byteLength > MAX_ADMIN_BODY_BYTES) {
-      console.warn("account import rejected", { reason: "body_too_large", bytes: bytes.byteLength });
+      logAccountAdd("warn", "auth_json_import", "request_validation", "failed", {
+        operationRef, reason: "body_too_large", bytes: bytes.byteLength
+      });
       return jsonError(413, "body_too_large", "import body exceeds 1 MiB");
     }
 
     let input: ImportRequest;
     try {
       input = JSON.parse(new TextDecoder().decode(bytes)) as ImportRequest;
-    } catch {
-      console.warn("account import rejected", { reason: "invalid_json", bytes: bytes.byteLength });
+    } catch (error) {
+      logAccountAdd("warn", "auth_json_import", "request_parse", "failed", {
+        operationRef, reason: "invalid_json", bytes: bytes.byteLength, error: errorReason(error)
+      });
       return jsonError(400, "invalid_json", "request body must be JSON");
     }
 
@@ -384,32 +391,38 @@ export class PoolCoordinator {
     try {
       tokens = parseAuthJson(text(input.content) || text(input.authJson));
     } catch (error) {
-      console.warn("account import rejected", {
+      logAccountAdd("warn", "auth_json_import", "auth_json_parse", "failed", {
+        operationRef,
         reason: "invalid_auth_file",
         bytes: bytes.byteLength,
-        detail: error instanceof Error ? error.message : "invalid auth.json"
+        error: errorReason(error)
       });
       return jsonError(400, "invalid_auth_file", error instanceof Error ? error.message : "invalid auth.json");
     }
 
     const label = text(input.label);
     if (label.length > 80) {
-      console.warn("account import rejected", { reason: "invalid_label", labelLength: label.length });
+      logAccountAdd("warn", "auth_json_import", "label_validation", "failed", {
+        operationRef, reason: "invalid_label", labelLength: label.length
+      });
       return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
     }
-    console.log("account import started", {
-      bytes: bytes.byteLength,
-      labelLength: label.length,
-      hasIdToken: Boolean(tokens.idToken)
+    logAccountAdd("log", "auth_json_import", "credentials_parsed", "progress", {
+      operationRef, bytes: bytes.byteLength, labelLength: label.length,
+      hasIdToken: Boolean(tokens.idToken), hasAccountId: Boolean(tokens.accountId)
     });
     let stored;
     try {
       stored = await this.storeAccount(tokens, label, "ok");
-    } catch {
-      console.error("account import failed", { stage: "store_account" });
+    } catch (error) {
+      logAccountAdd("error", "auth_json_import", "store_account", "failed", {
+        operationRef, error: errorReason(error)
+      });
       throw new Error("account import storage failed");
     }
-    console.log("account import completed", { existed: stored.existed });
+    logAccountAdd("log", "auth_json_import", "store_account", "completed", {
+      operationRef, existed: stored.existed
+    });
     return json(
       {
         account: { id: stored.id, accountId: tokens.accountId, label, state: "ok", enabled: true }
@@ -419,19 +432,36 @@ export class PoolCoordinator {
   }
 
   private async startDeviceLogin(request: Request): Promise<Response> {
+    const id = randomId("login");
+    const loginRef = (await sha256Hex(id)).slice(0, 12);
+    logAccountAdd("log", "device_login", "request_received", "started", { loginRef });
     try {
       assertPinnedOAuthIssuer(this.env.OAUTH_ISSUER);
-    } catch {
-      console.error("device login failed", { stage: "validate_oauth_configuration" });
+    } catch (error) {
+      logAccountAdd("error", "device_login", "validate_oauth_configuration", "failed", {
+        loginRef, error: errorReason(error)
+      });
       return jsonError(503, "oauth_misconfigured", "OAuth login is not configured safely");
     }
     const parsed = await this.readAdminJson<DeviceLoginStartRequest>(request);
-    if (parsed instanceof Response) return parsed;
+    if (parsed instanceof Response) {
+      logAccountAdd("warn", "device_login", "request_validation", "failed", {
+        loginRef, httpStatus: parsed.status
+      });
+      return parsed;
+    }
     const label = text(parsed.label);
-    if (label.length > 80) return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
+    if (label.length > 80) {
+      logAccountAdd("warn", "device_login", "label_validation", "failed", {
+        loginRef, reason: "invalid_label", labelLength: label.length
+      });
+      return jsonError(400, "invalid_label", "account label must not exceed 80 characters");
+    }
 
     this.pruneDeviceLogins();
-    console.log("device login started", { labelLength: label.length });
+    logAccountAdd("log", "device_login", "request_user_code", "progress", {
+      loginRef, labelLength: label.length
+    });
     let response: Response;
     try {
       response = await fetch(DEVICE_USER_CODE_URL, {
@@ -440,59 +470,75 @@ export class PoolCoordinator {
         body: JSON.stringify({ client_id: this.env.OAUTH_CLIENT_ID }),
         redirect: "error"
       });
-    } catch {
-      console.error("device login failed", { stage: "request_user_code", reason: "upstream_fetch_error" });
+    } catch (error) {
+      logAccountAdd("error", "device_login", "request_user_code", "failed", {
+        loginRef, reason: "upstream_fetch_error", error: errorReason(error)
+      });
       return jsonError(502, "device_login_failed", "could not reach ChatGPT sign-in");
     }
     if (response.status === 404) {
-      console.warn("device login unavailable", { stage: "request_user_code", upstreamStatus: response.status });
+      logAccountAdd("warn", "device_login", "request_user_code", "failed", {
+        loginRef, reason: "device_login_unavailable", ...await upstreamErrorFields(response)
+      });
       return jsonError(503, "device_login_unavailable", "device-code login is not enabled; import auth.json instead");
     }
     if (!response.ok) {
-      console.error("device login failed", { stage: "request_user_code", upstreamStatus: response.status });
+      logAccountAdd("error", "device_login", "request_user_code", "failed", {
+        loginRef, ...await upstreamErrorFields(response)
+      });
       return jsonError(502, "device_login_failed", "could not start ChatGPT sign-in");
     }
 
     let started;
     try {
       started = parseDeviceCodeStart(await response.json());
-    } catch {
-      console.error("device login failed", { stage: "parse_user_code_response" });
+    } catch (error) {
+      logAccountAdd("error", "device_login", "parse_user_code_response", "failed", {
+        loginRef, error: errorReason(error)
+      });
       return jsonError(502, "device_login_failed", "ChatGPT returned an invalid sign-in response");
     }
-    const key = await this.masterKey;
-    const [deviceAuthId, userCode] = await Promise.all([
-      encryptSecret(key, started.deviceAuthId),
-      encryptSecret(key, started.userCode)
-    ]);
-    const id = randomId("login");
     const createdAt = new Date();
     const expiresAt = new Date(createdAt.getTime() + DEVICE_LOGIN_TTL_MS);
     const nextPollAt = new Date(createdAt.getTime() + started.intervalSeconds * 1000);
-    this.state.storage.transactionSync(() => {
-      this.pruneDeviceLogins(createdAt.toISOString());
-      while (Number(this.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM oauth_device_logins").one().count) >= DEVICE_LOGIN_MAX) {
+    try {
+      const key = await this.masterKey;
+      const [deviceAuthId, userCode] = await Promise.all([
+        encryptSecret(key, started.deviceAuthId),
+        encryptSecret(key, started.userCode)
+      ]);
+      this.state.storage.transactionSync(() => {
+        this.pruneDeviceLogins(createdAt.toISOString());
+        while (Number(this.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM oauth_device_logins").one().count) >= DEVICE_LOGIN_MAX) {
+          this.sql.exec(
+            `DELETE FROM oauth_device_logins WHERE id IN (
+               SELECT id FROM oauth_device_logins ORDER BY created_at ASC, id ASC LIMIT 1
+             )`
+          );
+        }
         this.sql.exec(
-          `DELETE FROM oauth_device_logins WHERE id IN (
-             SELECT id FROM oauth_device_logins ORDER BY created_at ASC, id ASC LIMIT 1
-           )`
+          `INSERT INTO oauth_device_logins
+             (id, device_auth_id, user_code, label, interval_seconds, next_poll_at, polling_until, expires_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)`,
+          id,
+          deviceAuthId,
+          userCode,
+          label,
+          started.intervalSeconds,
+          nextPollAt.toISOString(),
+          expiresAt.toISOString(),
+          createdAt.toISOString()
         );
-      }
-      this.sql.exec(
-        `INSERT INTO oauth_device_logins
-           (id, device_auth_id, user_code, label, interval_seconds, next_poll_at, polling_until, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)`,
-        id,
-        deviceAuthId,
-        userCode,
-        label,
-        started.intervalSeconds,
-        nextPollAt.toISOString(),
-        expiresAt.toISOString(),
-        createdAt.toISOString()
-      );
+      });
+    } catch (error) {
+      logAccountAdd("error", "device_login", "persist_login_state", "failed", {
+        loginRef, error: errorReason(error)
+      });
+      return jsonError(500, "device_login_failed", "could not save ChatGPT sign-in state");
+    }
+    logAccountAdd("log", "device_login", "user_code_issued", "progress", {
+      loginRef, intervalSeconds: started.intervalSeconds
     });
-    console.log("device login code issued", { intervalSeconds: started.intervalSeconds });
     return json({
       loginId: id,
       verificationUrl: DEVICE_VERIFICATION_URL,
@@ -503,11 +549,20 @@ export class PoolCoordinator {
   }
 
   private async pollDeviceLogin(id: string): Promise<Response> {
+    const loginRef = (await sha256Hex(id)).slice(0, 12);
     const row = this.sql.exec<DeviceLoginRow>("SELECT * FROM oauth_device_logins WHERE id = ?", id).toArray()[0];
-    if (!row) return jsonError(404, "login_not_found", "sign-in was not found or has expired");
+    if (!row) {
+      logAccountAdd("warn", "device_login", "load_login_state", "failed", {
+        loginRef, reason: "not_found_or_expired"
+      });
+      return jsonError(404, "login_not_found", "sign-in was not found or has expired");
+    }
     const now = Date.now();
     if (Date.parse(row.expires_at) <= now) {
       this.state.storage.transactionSync(() => this.sql.exec("DELETE FROM oauth_device_logins WHERE id = ?", id));
+      logAccountAdd("warn", "device_login", "load_login_state", "failed", {
+        loginRef, reason: "expired"
+      });
       return jsonError(410, "login_expired", "sign-in expired; start again");
     }
     const nextPoll = Date.parse(row.next_poll_at);
@@ -538,7 +593,10 @@ export class PoolCoordinator {
         decryptSecret(key, row.device_auth_id),
         decryptSecret(key, row.user_code)
       ]);
-    } catch {
+    } catch (error) {
+      logAccountAdd("error", "device_login", "decrypt_login_state", "failed", {
+        loginRef, error: errorReason(error)
+      });
       this.deleteDeviceLogin(id);
       return jsonError(500, "login_state_invalid", "stored sign-in state could not be read; start again");
     }
@@ -551,15 +609,24 @@ export class PoolCoordinator {
         body: JSON.stringify({ device_auth_id: deviceAuthId, user_code: userCode }),
         redirect: "error"
       });
-    } catch {
+    } catch (error) {
+      logAccountAdd("error", "device_login", "poll_device_token", "failed", {
+        loginRef, reason: "upstream_fetch_error", error: errorReason(error)
+      });
       this.releaseDeviceLoginPoll(id, Number(row.interval_seconds));
       return jsonError(502, "device_login_failed", "could not check ChatGPT sign-in status");
     }
     if (tokenPoll.status === 403 || tokenPoll.status === 404) {
+      logAccountAdd("log", "device_login", "poll_device_token", "progress", {
+        loginRef, state: "authorization_pending", upstreamStatus: tokenPoll.status
+      });
       this.releaseDeviceLoginPoll(id, Number(row.interval_seconds));
       return this.deviceLoginPending(Number(row.interval_seconds) * 1000);
     }
     if (!tokenPoll.ok) {
+      logAccountAdd("error", "device_login", "poll_device_token", "failed", {
+        loginRef, ...await upstreamErrorFields(tokenPoll)
+      });
       this.releaseDeviceLoginPoll(id, Number(row.interval_seconds));
       return jsonError(502, "device_login_failed", "ChatGPT sign-in could not be completed");
     }
@@ -567,12 +634,16 @@ export class PoolCoordinator {
     let authorization;
     try {
       authorization = await parseDeviceAuthorizationCode(await tokenPoll.json());
-    } catch {
+    } catch (error) {
+      logAccountAdd("error", "device_login", "parse_authorization_code", "failed", {
+        loginRef, error: errorReason(error)
+      });
       this.deleteDeviceLogin(id);
       return jsonError(502, "device_login_failed", "ChatGPT returned an invalid authorization response");
     }
 
     let tokenResponse: Response;
+    logAccountAdd("log", "device_login", "exchange_authorization_code", "progress", { loginRef });
     try {
       const issuer = assertPinnedOAuthIssuer(this.env.OAUTH_ISSUER);
       tokenResponse = await fetch(issuer, {
@@ -587,11 +658,17 @@ export class PoolCoordinator {
         }),
         redirect: "error"
       });
-    } catch {
+    } catch (error) {
+      logAccountAdd("error", "device_login", "exchange_authorization_code", "failed", {
+        loginRef, reason: "upstream_fetch_error", error: errorReason(error)
+      });
       this.deleteDeviceLogin(id);
       return jsonError(502, "device_login_failed", "could not exchange the ChatGPT authorization code");
     }
     if (!tokenResponse.ok) {
+      logAccountAdd("error", "device_login", "exchange_authorization_code", "failed", {
+        loginRef, ...await upstreamErrorFields(tokenResponse)
+      });
       this.deleteDeviceLogin(id);
       return jsonError(502, "device_login_failed", "ChatGPT rejected the authorization code; start again");
     }
@@ -602,14 +679,39 @@ export class PoolCoordinator {
       const refreshToken = text(payload.refresh_token);
       const idToken = text(payload.id_token);
       const accountId = accountIdFromIdToken(idToken);
-      if (!accessToken || !refreshToken || !idToken || !accountId) throw new Error("missing token field");
+      if (!accessToken || !refreshToken || !idToken || !accountId) {
+        const missingFields = [
+          accessToken ? "" : "access_token",
+          refreshToken ? "" : "refresh_token",
+          idToken ? "" : "id_token",
+          accountId ? "" : "account_id"
+        ].filter(Boolean).join(",");
+        throw new Error(`missing token fields: ${missingFields}`);
+      }
       tokens = { accessToken, refreshToken, idToken, accountId };
-    } catch {
+    } catch (error) {
+      logAccountAdd("error", "device_login", "parse_token_response", "failed", {
+        loginRef, error: errorReason(error)
+      });
       this.deleteDeviceLogin(id);
       return jsonError(502, "device_login_failed", "ChatGPT returned incomplete credentials");
     }
 
-    const stored = await this.storeAccount(tokens, row.label, "unknown", id);
+    logAccountAdd("log", "device_login", "store_account", "progress", {
+      loginRef, hasAccountId: Boolean(tokens.accountId)
+    });
+    let stored;
+    try {
+      stored = await this.storeAccount(tokens, row.label, "unknown", id);
+    } catch (error) {
+      logAccountAdd("error", "device_login", "store_account", "failed", {
+        loginRef, error: errorReason(error)
+      });
+      return jsonError(500, "device_login_failed", "could not store the ChatGPT account");
+    }
+    logAccountAdd("log", "device_login", "store_account", "completed", {
+      loginRef, existed: stored.existed
+    });
     return json({
       status: "complete",
       account: { id: stored.id, accountId: tokens.accountId, label: row.label, state: "unknown", enabled: true }
