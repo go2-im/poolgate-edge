@@ -39,6 +39,7 @@ import {
   minimumHeadroom,
   parseStoredUsage,
   parseUsagePayload,
+  usageRouteCandidates,
   type CurrentUsage
 } from "./usage";
 import { logUsagePoll, type UsagePollSource } from "./usage-log";
@@ -2031,11 +2032,6 @@ export class PoolCoordinator {
     }
   }
 
-  private usageUrl(): string {
-    const responseUrl = new URL(this.upstreamUrl());
-    return `${responseUrl.origin}/backend-api/wham/usage`;
-  }
-
   private usageHeaders(account: DecryptedAccount): Headers {
     return new Headers({
       accept: "application/json",
@@ -2108,22 +2104,74 @@ export class PoolCoordinator {
       throw error;
     }
     let refreshed = false;
+    const usageRoutes = usageRouteCandidates(this.upstreamUrl());
     for (;;) {
-      let response: Response;
-      usageLog("log", "fetch_usage", "progress", { refreshed });
-      try {
-        response = await fetch(this.usageUrl(), {
-          method: "GET",
-          headers: this.usageHeaders(credentials),
-          redirect: SAFE_FETCH_REDIRECT,
-          signal: AbortSignal.timeout(USAGE_REQUEST_TIMEOUT_MS)
-        });
-      } catch (error) {
-        usageLog("error", "fetch_usage", "failed", {
+      let response: Response | undefined;
+      let usageRoute = "unknown";
+      const fetchDeadline = Date.now() + USAGE_REQUEST_TIMEOUT_MS;
+      for (const [index, route] of usageRoutes.entries()) {
+        const candidateIndex = index + 1;
+        const hasFallback = candidateIndex < usageRoutes.length;
+        usageLog("log", "fetch_usage", "progress", {
           refreshed,
-          reason: error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "upstream_fetch_error",
-          error: errorReason(error),
+          usageRoute: route.name,
+          candidateIndex,
+          candidateCount: usageRoutes.length
+        });
+        let candidate: Response;
+        try {
+          candidate = await fetch(route.url, {
+            method: "GET",
+            headers: this.usageHeaders(credentials),
+            redirect: SAFE_FETCH_REDIRECT,
+            signal: AbortSignal.timeout(Math.max(1, fetchDeadline - Date.now()))
+          });
+        } catch (error) {
+          const reason = error instanceof DOMException && error.name === "TimeoutError"
+            ? "timeout"
+            : "upstream_fetch_error";
+          usageLog(hasFallback ? "warn" : "error", "fetch_usage", hasFallback ? "progress" : "failed", {
+            refreshed,
+            usageRoute: route.name,
+            candidateIndex,
+            candidateCount: usageRoutes.length,
+            willRetryFallback: hasFallback,
+            reason,
+            error: errorReason(error),
+            durationMs: Date.now() - startedAt
+          });
+          if (hasFallback) continue;
+          this.deferProbe(accountId);
+          return jsonError(502, "usage_unavailable", "account usage is temporarily unavailable");
+        }
+
+        if (candidate.ok || candidate.status === 401 || candidate.status === 429) {
+          response = candidate;
+          usageRoute = route.name;
+          break;
+        }
+
+        const upstream = await upstreamErrorFields(candidate);
+        const reason = upstream.upstreamMitigation === "challenge" ? "upstream_challenge" : "upstream_rejected";
+        usageLog(hasFallback ? "warn" : "error", "fetch_usage", hasFallback ? "progress" : "failed", {
+          refreshed,
+          usageRoute: route.name,
+          candidateIndex,
+          candidateCount: usageRoutes.length,
+          willRetryFallback: hasFallback,
+          reason,
+          ...upstream,
           durationMs: Date.now() - startedAt
+        });
+        candidate.body?.cancel().catch(() => undefined);
+        if (!hasFallback) {
+          this.deferProbe(accountId);
+          return jsonError(502, "usage_unavailable", "account usage is temporarily unavailable");
+        }
+      }
+      if (!response) {
+        usageLog("error", "fetch_usage", "failed", {
+          reason: "candidate_routes_exhausted", candidateCount: usageRoutes.length
         });
         this.deferProbe(accountId);
         return jsonError(502, "usage_unavailable", "account usage is temporarily unavailable");
@@ -2133,19 +2181,25 @@ export class PoolCoordinator {
         const upstream = await upstreamErrorFields(response);
         response.body?.cancel().catch(() => undefined);
         if (refreshed) {
-          usageLog("error", "authorize_usage", "failed", { reason: "unauthorized_after_refresh", ...upstream });
+          usageLog("error", "authorize_usage", "failed", {
+            usageRoute, reason: "unauthorized_after_refresh", ...upstream
+          });
           this.markState(accountId, "expired", "");
           return jsonError(502, "account_authorization_expired", "account authorization expired after refresh");
         }
-        usageLog("warn", "authorize_usage", "progress", { reason: "unauthorized_refreshing", ...upstream });
+        usageLog("warn", "authorize_usage", "progress", {
+          usageRoute, reason: "unauthorized_refreshing", ...upstream
+        });
         try {
           credentials = await this.refreshAccount(accountId, credentials.credentialVersion);
           refreshed = true;
-          usageLog("log", "refresh_credentials", "completed");
+          usageLog("log", "refresh_credentials", "completed", { usageRoute });
           continue;
         } catch (error) {
           const terminal = error instanceof OAuthRefreshFailure && error.terminal;
-          usageLog("error", "refresh_credentials", "failed", { terminal, error: errorReason(error) });
+          usageLog("error", "refresh_credentials", "failed", {
+            usageRoute, terminal, error: errorReason(error)
+          });
           if (error instanceof OAuthRefreshFailure && error.terminal) {
             this.markState(accountId, "expired", "");
             return jsonError(502, "account_authorization_expired", "account authorization expired");
@@ -2160,29 +2214,18 @@ export class PoolCoordinator {
         const upstream = await upstreamErrorFields(response);
         const until = new Date(Date.now() + retryAfterMs).toISOString();
         usageLog("warn", "fetch_usage", "failed", {
-          reason: "rate_limited", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstream
+          usageRoute, reason: "rate_limited", retryAfterSeconds: Math.ceil(retryAfterMs / 1000), ...upstream
         });
         response.body?.cancel().catch(() => undefined);
         this.markState(accountId, "cooldown", until);
         return jsonError(502, "usage_rate_limited", "account usage polling is temporarily rate limited");
       }
-      if (!response.ok) {
-        const upstream = await upstreamErrorFields(response);
-        const reason = upstream.upstreamMitigation === "challenge" ? "upstream_challenge" : "upstream_rejected";
-        usageLog("error", "fetch_usage", "failed", {
-          reason, ...upstream, durationMs: Date.now() - startedAt
-        });
-        response.body?.cancel().catch(() => undefined);
-        this.deferProbe(accountId);
-        return jsonError(502, "usage_unavailable", "account usage is temporarily unavailable");
-      }
-
       let parsed: ReturnType<typeof parseUsagePayload>;
       try {
         parsed = parseUsagePayload(await this.readUsageJson(response));
       } catch (error) {
         usageLog("error", "parse_usage_response", "failed", {
-          error: errorReason(error), durationMs: Date.now() - startedAt
+          usageRoute, error: errorReason(error), durationMs: Date.now() - startedAt
         });
         this.deferProbe(accountId);
         return jsonError(502, "invalid_usage_response", "account usage response is invalid");
@@ -2249,6 +2292,7 @@ export class PoolCoordinator {
         throw error;
       }
       usageLog("log", "complete", "completed", {
+        usageRoute,
         durationMs: Date.now() - startedAt,
         planType: parsed.planType,
         windowCount: parsed.windows.length,

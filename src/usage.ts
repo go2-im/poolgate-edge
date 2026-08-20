@@ -14,6 +14,20 @@ export interface CurrentUsage {
   headroom: number;
 }
 
+export interface UsageRouteCandidate {
+  name: "backend_api_wham" | "wham" | "codex_api";
+  url: string;
+}
+
+export function usageRouteCandidates(upstreamUrl: string): UsageRouteCandidate[] {
+  const origin = new URL(upstreamUrl).origin;
+  return [
+    { name: "backend_api_wham", url: `${origin}/backend-api/wham/usage` },
+    { name: "wham", url: `${origin}/wham/usage` },
+    { name: "codex_api", url: `${origin}/api/codex/usage` }
+  ];
+}
+
 interface RawWindow {
   used_percent?: unknown;
   limit_window_seconds?: unknown;
